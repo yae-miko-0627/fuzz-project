@@ -1,22 +1,179 @@
 """
-命令行目标适配器（占位）
+最小化的 CommandTarget 实现（针对 Ubuntu Docker 环境）。
 
-此类用于以命令行方式运行被测程序并收集执行结果/崩溃信息。
+职责：
+- 启动子进程运行被测程序（每次单独新进程），
+- 支持 `stdin` 和 `file` 两种输入方式，
+- 处理超时（kill 进程组），
+- 返回最小且稳定的运行结果供上层调度器/评估器使用。
+
+实现原则：保留最必要信息，简化复杂功能（不做资源限制、不过度测量）。
 """
 
-from typing import List, Dict, Any
+from dataclasses import dataclass
+import subprocess
+import tempfile
+import os
+import time
+from typing import List, Optional
+
+
+@dataclass
+class CommandTargetResult:
+    """最小化的运行结果结构。
+
+    字段：
+    - status: 'ok'|'crash'|'hang'|'error'
+    - exit_code: 退出码（若可得）
+    - timed_out: 是否超时
+    - stdout/stderr: 子进程输出（bytes）
+    - wall_time: 运行耗时（秒）
+    - artifact_path: 若发生崩溃，保存触发输入的文件路径
+    """
+
+    status: str
+    exit_code: Optional[int] = None
+    timed_out: bool = False
+    stdout: Optional[bytes] = None
+    stderr: Optional[bytes] = None
+    wall_time: float = 0.0
+    artifact_path: Optional[str] = None
 
 
 class CommandTarget:
-    """占位的命令行目标封装器。
+    """简化版 CommandTarget。
 
-    方法示例：
-    - run(input_bytes): 将输入传给目标并返回执行结果摘要
+    参数：
+    - cmd: 命令列表，例如 ['/workspace/examples/test-instr']
+    - workdir: 工作目录（默认使用临时目录）
+    - timeout_default: 默认超时（秒）
+
+    注意：覆盖信息不在此处收集，留给 instrumentation 模块。
     """
 
-    def __init__(self, cmd: List[str]):
+    def __init__(self, cmd: List[str], workdir: Optional[str] = None, timeout_default: float = 1.0):
         self.cmd = cmd
+        self.workdir = workdir
+        self.timeout_default = timeout_default
 
-    def run(self, input_data: bytes) -> Dict[str, Any]:
-        """运行目标并返回结果（占位）。"""
-        return {"status": "ok", "signal": None}
+    def run(self, input_data: bytes, mode: str = "stdin", timeout: Optional[float] = None,
+            extra_args: Optional[List[str]] = None) -> CommandTargetResult:
+        """执行目标并返回最小结果。
+
+        简要流程：
+        1) 确定工作目录（默认临时目录），并在 file 模式下写入输入文件；
+        2) 使用 subprocess.Popen 启动子进程（在 Unix 上创建新进程组以便 kill）；
+        3) 使用 communicate() 带 timeout 捕获 stdout/stderr；超时时 kill 进程组并标记 hang；
+        4) 若 returncode 显示异常（<0 或 >0），把输入保存为 artifact；
+        5) 返回 CommandTargetResult。
+        """
+
+        timeout = timeout if timeout is not None else self.timeout_default
+        extra_args = extra_args or []
+
+        # 1) 工作目录与输入准备
+        tmpdir = None
+        if self.workdir is None:
+            tmpdir = tempfile.TemporaryDirectory(prefix="miniafl_run_")
+            run_workdir = tmpdir.name
+        else:
+            run_workdir = self.workdir
+
+        input_path = None
+        if mode == "file":
+            # 在工作目录中写入临时输入文件
+            fd, input_path = tempfile.mkstemp(prefix="input_", dir=run_workdir)
+            os.close(fd)
+            with open(input_path, "wb") as f:
+                f.write(input_data)
+
+        # 构造命令行
+        cmd = list(self.cmd) + extra_args
+        if mode == "file" and input_path is not None:
+            # 约定：把文件路径作为最后一个参数传入目标
+            cmd = cmd + [input_path]
+
+        # 2) 启动子进程（在 Unix 上使用 setsid 创建新进程组）
+        use_preexec = hasattr(os, "setsid")
+        preexec_fn = (lambda: os.setsid()) if use_preexec else None
+
+        start = time.time()
+        try:
+            proc = subprocess.Popen(cmd,
+                                    stdin=subprocess.PIPE if mode == "stdin" else None,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    cwd=run_workdir,
+                                    preexec_fn=preexec_fn)
+
+            # 3) 发送输入（stdin 模式）并等待结果，处理超时
+            try:
+                out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                # 超时：先尝试终止，再强杀整个进程组
+                try:
+                    if use_preexec:
+                        os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
+                    else:
+                        proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    out, err = proc.communicate(timeout=0.5)
+                except Exception:
+                    try:
+                        if use_preexec:
+                            os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+                        else:
+                            proc.kill()
+                    except Exception:
+                        pass
+                    out, err = proc.communicate()
+
+            exit_code = proc.returncode
+        except Exception as e:
+            # 启动失败视为 error
+            end = time.time()
+            if tmpdir:
+                tmpdir.cleanup()
+            return CommandTargetResult(status="error", exit_code=None, timed_out=False,
+                                       stdout=None, stderr=str(e).encode(), wall_time=end - start,
+                                       artifact_path=None)
+
+        end = time.time()
+        wall_time = end - start
+
+        # 4) 决定状态并在崩溃时保存触发输入
+        status = "ok"
+        artifact_path = None
+        if timed_out:
+            status = "hang"
+        else:
+            # 若进程由信号结束（returncode < 0）或非零退出码，可视为 crash（简化策略）
+            if exit_code is None:
+                status = "error"
+            elif exit_code != 0:
+                status = "crash"
+                try:
+                    artifact_dir = os.path.join(run_workdir, "artifacts")
+                    os.makedirs(artifact_dir, exist_ok=True)
+                    artifact_path = os.path.join(artifact_dir, f"crash_input_{int(time.time()*1000)}.bin")
+                    with open(artifact_path, "wb") as f:
+                        f.write(input_data)
+                except Exception:
+                    artifact_path = None
+
+        # 5) 返回最小结果
+        result = CommandTargetResult(status=status,
+                                     exit_code=exit_code,
+                                     timed_out=timed_out,
+                                     stdout=out,
+                                     stderr=err,
+                                     wall_time=wall_time,
+                                     artifact_path=artifact_path)
+
+        # 保留 tmpdir 直到 Python GC 清理（若希望立即清理，可调用 tmpdir.cleanup()）
+        return result
+
