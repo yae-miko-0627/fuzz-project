@@ -1,0 +1,96 @@
+"""
+运行结果监控组件
+
+功能：
+- 记录每次执行的元数据（时间戳、耗时、状态、覆盖新点数等）
+- 保存特殊测试用例（crash/hang/高新颖度）到 artifacts 目录
+- 提供导出/序列化接口供评估模块使用
+
+该模块不直接负责产生覆盖，而是接受来自上层的覆盖数据（`CoverageData` 或整数新点数）。
+"""
+from __future__ import annotations
+
+import os
+import time
+import json
+from dataclasses import dataclass, asdict
+from typing import Optional, List
+
+from ..instrumentation.coverage import CoverageData
+
+
+@dataclass
+class RunRecord:
+    timestamp: float
+    sample_id: Optional[int]
+    status: str
+    wall_time: float
+    novelty: int
+    cum_coverage: int
+    artifact_path: Optional[str]
+
+
+class Monitor:
+    """监控器：维护运行历史、累计覆盖，并保存特殊样本。"""
+
+    def __init__(self, out_dir: str = "monitor_artifacts", novelty_threshold: int = 1):
+        self.out_dir = out_dir
+        os.makedirs(self.out_dir, exist_ok=True)
+        self.records: List[RunRecord] = []
+        self.cumulative_cov = CoverageData()
+        self.novelty_threshold = novelty_threshold
+
+    def record_run(self, sample_id: Optional[int], sample: bytes, status: str,
+                   wall_time: float, cov: Optional[CoverageData] = None,
+                   artifact_path: Optional[str] = None) -> RunRecord:
+        """记录一次运行。
+
+        - `cov`：可选的 CoverageData（若有，则用于计算 novelty 与更新累计覆盖）。
+        - `artifact_path`：若产生崩溃，该路径可指向已保存的触发输入文件。
+        返回创建的 RunRecord。
+        """
+        ts = time.time()
+        novelty = 0
+        if cov is not None:
+            # 计算新颖点数：cov.points - cumulative.points
+            new_points = set(cov.points) - set(self.cumulative_cov.points)
+            novelty = len(new_points)
+            # 合并到累计
+            self.cumulative_cov.merge(cov)
+
+        cum_cov_size = len(self.cumulative_cov.points)
+
+        rec = RunRecord(timestamp=ts, sample_id=sample_id, status=status,
+                        wall_time=wall_time, novelty=novelty,
+                        cum_coverage=cum_cov_size,
+                        artifact_path=artifact_path)
+        self.records.append(rec)
+
+        # 保存特殊样本：crash/hang 或 novelty 超阈值
+        if status in ("crash", "hang") or novelty >= self.novelty_threshold:
+            fname = f"sample_{int(ts*1000)}_{status}.bin"
+            p = os.path.join(self.out_dir, fname)
+            try:
+                with open(p, "wb") as f:
+                    f.write(sample)
+                # 若没有 artifact_path，记录文件路径
+                if artifact_path is None:
+                    artifact_path = p
+                rec.artifact_path = artifact_path
+            except Exception:
+                pass
+
+        return rec
+
+    def export_records(self, path: Optional[str] = None) -> str:
+        """把记录导出为 JSON 文件，返回文件路径。"""
+        path = path or os.path.join(self.out_dir, "monitor_records.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([asdict(r) for r in self.records], f, ensure_ascii=False, indent=2)
+        except Exception:
+            raise
+        return path
+
+
+__all__ = ["Monitor", "RunRecord"]

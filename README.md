@@ -63,3 +63,31 @@ python -c "from mini_afl_py.fuzzer import MiniFuzzer; import sys; f=MiniFuzzer(t
 ```
 
 	- 结果：确定性变异（`Bitflip`/`Arith`/`Interest`）与非确定性变异（`Havoc`/`Splice`）均执行正常，日志显示 `Scheduler` 成功将若干样本加入语料池（示例：`Scheduler added sample id=1/2`）。
+
+## 实现日志：监控与评估（2025-12-17）
+
+2025-12-17：实现运行结果监控与覆盖评估的基础组件，便于在无完整插装时也能记录执行统计并分析覆盖随时间变化。
+
+- 新增监控模块：mini_afl_py/core/monitor.py
+  - 实现 Monitor 与 RunRecord，记录每次运行的时间戳、sample_id、status、wall_time、
+ovelty（新增覆盖点数）和累计覆盖。
+  - 在 crash/hang 或达到新颖度阈值时自动保存触发样本到 monitor_artifacts/（可配置）。
+
+- 新增评估模块：mini_afl_py/core/eval.py
+  - 提供 coverage_curve() 将 Monitor.records 转为覆盖率随时间变化的曲线，及 export_curve_csv() 导出为 CSV 以便绘图或分析。
+
+- 简单验证：已添加示例测试脚本 mini_afl_py/tests/run_monitor_test.py，演示 Monitor 与 CoverageData 的交互，并导出覆盖曲线为 	est_monitor/curve.csv。
+
+## 实现日志：将 `novelty`（覆盖新增点）纳入调度器（2025-12-17）
+
+2025-12-17：在 `mini_afl_py/core/scheduler.py` 中增强 `report_result()`，把运行时产生的覆盖新增点（在运行路径中称为 `coverage_new` 或 `novelty`）作为能量分配的参考信号。
+
+- 主要改动：
+	- `report_result()` 现在会在收到 `result` 时读取 `coverage_new` / `novelty` 字段；
+	- 对已存在的语料条目：如果观测到 `novelty>0`，则对该候选样本按 `novelty` 做能量提升（简单映射：`novelty 1 -> +3 energy`，可进一步调优）；
+	- 对新发现样本：若 `novelty>0` 或 `status` 为 `crash`/`hang`，则以较高初始能量将其加入语料池，保证后续有更多机会被变异和调查；
+	- 仍保持 `calculate_score()` 的启发式评分回路，用于对长期统计（avg_exec_time、size、cycles、hits）作背景性能量调整。
+
+- 动机与效果：
+	- 使调度器能更直接地把“发现新覆盖位点”的反馈转化为更多尝试资源，从而在没有完整 AFL 位图接入前也能提高探索效率；
+	- 在本地快速验证（`quick_sched_test.py`）中已确认：当 `coverage_new` 为正时，样本会被提升能量并保留在语料中，语料池条目统计（`hits`/`avg_exec_time`）正确更新。

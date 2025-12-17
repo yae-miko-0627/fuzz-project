@@ -120,19 +120,22 @@ class Scheduler:
     def report_result(self, sample: bytes, result: object) -> Optional[int]:
         """接收执行结果并根据简化策略更新语料池。
 
-        简单策略：
-        - 若 `result` 表示 crash 或 hang（包含属性 `status`），则把该样本加入语料并提升能量；
+        简单策略扩展：
+        - 若 `result` 包含 `coverage_new`（novelty）则优先提升该样本的能量并尽可能保留；
+        - crash/hang 始终给予较高能量；
         - 否则以小概率把样本加入语料以增加多样性。
 
         返回新加入样本的 id（若未加入返回 None）。
         """
         status = getattr(result, "status", None)
+        novelty = getattr(result, 'coverage_new', 0) or getattr(result, 'novelty', 0)
+
         # 若样本已在语料池中，则更新其统计（exec time、hits、energy）
         for cid, cand in list(self._corpus.items()):
             if cand.data == sample:
                 # 更新平均执行时间（简单指数移动平均）
                 try:
-                    t = float(getattr(result, "wall_time", 0.0) or 0.0)
+                    t = float(getattr(result, "wall_time", 0.0) or getattr(result, 'exec_time', 0.0) or 0.0)
                 except Exception:
                     t = 0.0
                 if cand.avg_exec_time <= 0.0:
@@ -141,17 +144,24 @@ class Scheduler:
                     alpha = 0.3
                     cand.avg_exec_time = alpha * t + (1 - alpha) * cand.avg_exec_time
                 cand.hits += 1
-                # 若为 crash/hang，提升能量
+                # 若观察到新覆盖位点（novelty），提升能量
+                if novelty and novelty > 0:
+                    boost = int(2 + novelty)  # 简单映射：novelty 1 -> +3 energy
+                    cand.energy = max(cand.energy, cand.energy + boost)
+                # crash/hang 获得更高能量保障
                 if status in ("crash", "hang"):
-                    cand.energy = max(cand.energy, 8)
+                    cand.energy = max(cand.energy, 12)
                 else:
-                    # 依据新的统计重新计算能量
-                    cand.energy = self.calculate_score(cand)
+                    # 依据新的统计重新计算能量（保持原有评分逻辑）
+                    cand.energy = max(1, int(self.calculate_score(cand)))
                 return cid
 
-        # 若不在语料中，则根据结果决定是否把该样本加入语料
+        # 不在语料中，根据结果决定是否把该样本加入语料
         if status in ("crash", "hang"):
-            cid = self.add_seed(sample, energy=8)
+            cid = self.add_seed(sample, energy=max(12, int(1 + novelty * 3)))
+            return cid
+        if novelty and novelty > 0:
+            cid = self.add_seed(sample, energy=max(12, int(1 + novelty * 3)))
             return cid
         if random.random() < 0.01:
             cid = self.add_seed(sample, energy=1)

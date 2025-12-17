@@ -10,6 +10,8 @@ from typing import List, Optional
 
 from .core.scheduler import Scheduler
 from .targets.command_target import CommandTarget, CommandTargetResult
+from .core.monitor import Monitor
+from .instrumentation.coverage import parse_trace_count_file, CoverageData
 from .mutators.bitflip_mutator import BitflipMutator
 from .mutators.arith_mutator import ArithMutator
 from .mutators.interest_mutator import InterestMutator
@@ -31,7 +33,15 @@ class MiniFuzzer:
 
     def __init__(self, target_cmd: List[str], workdir: Optional[str] = None, timeout: float = 1.0):
         self.scheduler = Scheduler()
+        # 若未提供工作目录，创建一个持久目录用于保存运行产物/coverage/artifacts，便于监控解析
+        import os
+        if workdir is None:
+            workdir = os.path.abspath(os.path.join(os.getcwd(), "miniafl_runs"))
+            os.makedirs(workdir, exist_ok=True)
         self.target = CommandTarget(cmd=target_cmd, workdir=workdir, timeout_default=timeout)
+
+        # 监控器：记录执行统计、累计覆盖，并保存特殊样本
+        self.monitor = Monitor(out_dir=os.path.join(workdir, "monitor_artifacts"), novelty_threshold=1)
 
         # mutators
         self.bitflip = BitflipMutator()
@@ -70,6 +80,19 @@ class MiniFuzzer:
                     if count >= limit:
                         break
                     res = self.target.run(mutated)
+                    # 尝试解析覆盖并记录运行到 Monitor
+                    try:
+                        cov = parse_trace_count_file(self.target.workdir)
+                    except Exception:
+                        cov = None
+                    try:
+                        rec = self.monitor.record_run(sample_id=candidate.id, sample=mutated,
+                                                     status=res.status, wall_time=res.wall_time,
+                                                     cov=cov, artifact_path=res.artifact_path)
+                        # 将 novelty 传给 scheduler（通过在 result 上设置属性，供 report_result 使用）
+                        setattr(res, "novelty", rec.novelty)
+                    except Exception:
+                        setattr(res, "novelty", 0)
                     print(f"[det] mutator={mutator.__class__.__name__} status={res.status} time={res.wall_time:.3f}")
                     self._maybe_add_to_corpus(mutated, res)
                     count += 1
@@ -80,6 +103,17 @@ class MiniFuzzer:
                 if hcount >= 8:
                     break
                 res = self.target.run(mutated)
+                try:
+                    cov = parse_trace_count_file(self.target.workdir)
+                except Exception:
+                    cov = None
+                try:
+                    rec = self.monitor.record_run(sample_id=candidate.id, sample=mutated,
+                                                 status=res.status, wall_time=res.wall_time,
+                                                 cov=cov, artifact_path=res.artifact_path)
+                    setattr(res, "novelty", rec.novelty)
+                except Exception:
+                    setattr(res, "novelty", 0)
                 print(f"[havoc] status={res.status} time={res.wall_time:.3f}")
                 self._maybe_add_to_corpus(mutated, res)
                 hcount += 1
@@ -93,6 +127,17 @@ class MiniFuzzer:
                     if scount >= 6:
                         break
                     res = self.target.run(mutated)
+                    try:
+                        cov = parse_trace_count_file(self.target.workdir)
+                    except Exception:
+                        cov = None
+                    try:
+                        rec = self.monitor.record_run(sample_id=candidate.id, sample=mutated,
+                                                     status=res.status, wall_time=res.wall_time,
+                                                     cov=cov, artifact_path=res.artifact_path)
+                        setattr(res, "novelty", rec.novelty)
+                    except Exception:
+                        setattr(res, "novelty", 0)
                     print(f"[splice] status={res.status} time={res.wall_time:.3f}")
                     self._maybe_add_to_corpus(mutated, res)
                     scount += 1
