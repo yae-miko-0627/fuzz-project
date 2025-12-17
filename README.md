@@ -27,3 +27,20 @@
 	- 在检测到 crash（简化：非零退出码或异常）时，将触发输入保存到 `artifacts/` 目录以便复现与最小化。
 
 后续计划：将 `CommandTarget` 与 `Scheduler`、`Mutator`、`Instrumentation` 集成，构建最小可运行的 fuzz 循环，并增加更多测试以覆盖 `file`、`stdin`、超时与崩溃分类场景。
+
+## 实现日志：变异器与 fuzz 循环集成（2025-12-17）
+
+2025-12-17：完成初始变异算子实现并把变异器接入到一个最小 fuzz 主循环，方便快速验证和迭代。
+
+- 新增/完善变异器实现（位置：`mini_afl_py/mutators/`）：
+	- `bitflip_mutator.py`：逐位翻转变异（逐比特取反，默认限制为前 64 位）。
+	- `arith_mutator.py`：对 1/2/4 字节字段进行小幅算术加减（实现中针对 2/4 字节使用 `int.from_bytes`/`to_bytes` 保持小端且可读性更好）。
+	- `interest_mutator.py`：用“有趣值”（边界/特殊值）替换 1/2/4 字节字段以触发边界条件。
+	- `havoc_mutator.py`：随机多次编辑（翻转/异或/插入/删除/设置）以生成较大扰动的样本。
+	- `splice_mutator.py`：从语料池选择另一样本并在随机断点拼接，形成组合输入。
+
+- 注释与可读性改进：
+	- 为上述变异器补充了中文文档字符串与行内注释，`arith_mutator` 中 2/4 字节处理改为更可读的 `int.from_bytes`/`to_bytes` 实现以保持与原有行为一致。
+
+- 集成：
+	- 新增最小 fuzz 循环实现：`mini_afl_py/fuzzer.py`，将 `Scheduler`、变异器与 `CommandTarget` 串联，按阶段执行变异（确定性阶段：`bitflip`/`arith`/`interest`，非确定性阶段：`havoc`/`splice`），并用简单启发式把有趣样本加入内部语料池。
