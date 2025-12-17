@@ -6,8 +6,6 @@
 - 支持 `stdin` 和 `file` 两种输入方式，
 - 处理超时（kill 进程组），
 - 返回最小且稳定的运行结果供上层调度器/评估器使用。
-
-实现原则：保留最必要信息，简化复杂功能（不做资源限制、不过度测量）。
 """
 
 from dataclasses import dataclass
@@ -173,7 +171,5 @@ class CommandTarget:
                                      stderr=err,
                                      wall_time=wall_time,
                                      artifact_path=artifact_path)
-
-        # 保留 tmpdir 直到 Python GC 清理（若希望立即清理，可调用 tmpdir.cleanup()）
         return result
 
