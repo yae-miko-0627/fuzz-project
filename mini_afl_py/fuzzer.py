@@ -32,8 +32,6 @@ class MiniFuzzer:
     def __init__(self, target_cmd: List[str], workdir: Optional[str] = None, timeout: float = 1.0):
         self.scheduler = Scheduler()
         self.target = CommandTarget(cmd=target_cmd, workdir=workdir, timeout_default=timeout)
-        # 内部语料池（用于 splice），初始与 scheduler 中的种子保持一致
-        self.corpus: List[bytes] = []
 
         # mutators
         self.bitflip = BitflipMutator()
@@ -42,23 +40,14 @@ class MiniFuzzer:
         self.havoc = HavocMutator()
 
     def add_seed(self, seed: bytes) -> None:
-        """向调度器和内部语料库添加初始种子。"""
+        """向调度器添加初始种子（会自动加入语料池）。"""
         self.scheduler.add_seed(seed)
-        self.corpus.append(seed)
 
     def _maybe_add_to_corpus(self, sample: bytes, result: CommandTargetResult) -> None:
-        """根据最简单的启发式决定是否把样本加入语料池用于后续 splice。
-
-        当前策略：
-        - 若引发 crash/hang，始终加入（便于后续分析与复现）；
-        - 若为 ok，则以小概率（1%）加入以扩充语料多样性。
-        """
-        if result.status in ("crash", "hang"):
-            self.corpus.append(sample)
-            print("[fuzzer] Added crash/hang sample to corpus (len={})".format(len(self.corpus)))
-        else:
-            if random.random() < 0.01:
-                self.corpus.append(sample)
+        """委托给 `Scheduler.report_result` 来决定是否把样本加入语料池。"""
+        nid = self.scheduler.report_result(sample, result)
+        if nid is not None:
+            print(f"[fuzzer] Scheduler added sample id={nid} to corpus")
 
     def run(self, run_time: Optional[float] = None) -> None:
         """运行 fuzz 循环，若 run_time 为 None 则使用 DEFAULTS['fuzz_time']。"""
@@ -77,7 +66,7 @@ class MiniFuzzer:
             # 确定性阶段：bitflip / arith / interest
             for mutator, limit in ((self.bitflip, 16), (self.arith, 64), (self.interest, 64)):
                 count = 0
-                for mutated in mutator.mutate(candidate):
+                for mutated in mutator.mutate(candidate.data):
                     if count >= limit:
                         break
                     res = self.target.run(mutated)
@@ -87,7 +76,7 @@ class MiniFuzzer:
 
             # 非确定性阶段：havoc
             hcount = 0
-            for mutated in self.havoc.mutate(candidate):
+            for mutated in self.havoc.mutate(candidate.data):
                 if hcount >= 8:
                     break
                 res = self.target.run(mutated)
@@ -96,10 +85,11 @@ class MiniFuzzer:
                 hcount += 1
 
             # splice（需要语料池）
-            if self.corpus:
-                sp = SpliceMutator(corpus=self.corpus, attempts=6)
+            corpus_for_splice = self.scheduler.corpus
+            if corpus_for_splice:
+                sp = SpliceMutator(corpus=corpus_for_splice, attempts=6)
                 scount = 0
-                for mutated in sp.mutate(candidate):
+                for mutated in sp.mutate(candidate.data):
                     if scount >= 6:
                         break
                     res = self.target.run(mutated)

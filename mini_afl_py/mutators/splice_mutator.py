@@ -29,7 +29,6 @@ class SpliceMutator:
     def mutate(self, data: bytes) -> Iterable[bytes]:
         """对当前输入尝试与语料中其他样本拼接，yield 拼接结果。
 
-        细节：
         - 若语料为空，则不产生任何变体。
         - 每次选择一条随机样本 `other`，随机选择 `data` 和 `other` 的断点并拼接。
         """
