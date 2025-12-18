@@ -11,8 +11,9 @@ DEFAULTS = {
 
 # 与 AFL++ 相关的默认配置
 DEFAULTS.update({
-    # instrumentation_mode: 'none'|'python-trace'|'afl'
-    "instrumentation_mode": "afl",
+    # instrumentation_mode: 'none'|'python-trace'|'afl'|'shm_py'
+    # 默认采用 Python SHM 管理（shm_py），兼容 afl-cc 插装
+    "instrumentation_mode": "shm_py",
     # 系统上 afl-showmap 的命令（可被覆盖）
     "afl_showmap_path": "afl-showmap",
     # 系统上 afl-cc 的命令（用于构建目标，可为空，表示手动构建）
@@ -25,6 +26,6 @@ DEFAULTS.update({
 def load_config(path: str) -> dict:
     """从文件加载配置（占位实现）。
 
-    当前版本仅返回 DEFAULTS，后续会实现文件解析和覆盖。
+    当前版本仅返回 DEFAULTS。
     """
     return DEFAULTS.copy()
