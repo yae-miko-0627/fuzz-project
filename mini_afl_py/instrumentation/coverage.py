@@ -1,30 +1,30 @@
-"""
-轻量级覆盖数据收集器（占位实现）。
+"""AFL 适配的覆盖工具。
 
-目的：
-- 提供一个最小的 CoverageData / CoverageCollector API，供后续把覆盖信息纳入 `Scheduler.calculate_score()`。
-- 当前实现提供：从 trace 输出文件的占位解析、合并覆盖集合、导出简单哈希位图（用于快速比较/去重）。
-
-说明：不同插装/工具会输出不同格式（gcov、llvm-cov、trace 模块、lcov 等），本模块可逐步扩展解析器以适配项目需要。
+本模块聚焦于基于 edge id 的覆盖表示（AFL 位图 / afl-showmap 输出）。
+已移除基于 Python `trace` 的文本解析与源码行号覆盖表示，优先使用 AFL 的
+edge/bitmap 模型。
 """
+
 from __future__ import annotations
 
-import hashlib
 import os
-from typing import Set, Tuple, Iterable
+from typing import Set
 
 
 class CoverageData:
-    """存储覆盖位置的简单容器。
+    """存储整数形式 edge id 的覆盖容器（AFL 风格）。
 
-    内部以 (filename, lineno) 的元组集合保存。提供合并与到位图的导出。
+    内部 `points` 为整数集合，每个整数表示一个被命中的 edge id。
     """
 
     def __init__(self) -> None:
-        self.points: Set[Tuple[str, int]] = set()
+        self.points: Set[int] = set()
 
-    def add(self, filename: str, lineno: int) -> None:
-        self.points.add((os.path.normpath(filename), int(lineno)))
+    def add_edge(self, edge_id: int) -> None:
+        try:
+            self.points.add(int(edge_id))
+        except Exception:
+            pass
 
     def merge(self, other: "CoverageData") -> None:
         self.points.update(other.points)
@@ -33,59 +33,64 @@ class CoverageData:
         return len(self.points)
 
     def to_bitmap(self, size: int = 65536) -> bytearray:
-        """基于文件名+行号的哈希，生成固定大小的位图（字节数组），用于快速比较/去重。
+        """从整数 edge id 生成简易位图。
 
-        这不是高保真的位图，而是用于调度器在没有精确工具时的近似判别。
+        使用取模将 edge id 映射到位图索引，产生用于快速比较的紧凑表示。
         """
         bitmap = bytearray(size)
-        for fname, ln in self.points:
-            h = hashlib.sha1(f"{fname}:{ln}".encode("utf-8")).digest()
-            idx = int.from_bytes(h[:4], "little") % size
-            bitmap[idx] = 1
+        for e in self.points:
+            try:
+                idx = int(e) % size
+                bitmap[idx] = 1
+            except Exception:
+                continue
         return bitmap
 
+def parse_afl_map(path: str) -> CoverageData:
+    """解析 afl-showmap 的输出（文本或二进制格式），返回 CoverageData。
 
-def parse_trace_count_file(path: str) -> CoverageData:
-    """尝试解析 trace 模块输出的计数文件（占位解析）。
-
-    注意：不同 python trace/coverage 的输出格式不同。本实现做尽可能稳健的解析：
-    - 如果 `path` 是目录，将扫描目录下所有以 `.cover` 或 `.cov` 结尾的文件并尝试解析行号。
-    - 如果是单个文件，会尝试解析每一行，匹配 `filename:lineno` 风格的记录（若无法识别则返回空）。
+    兼容策略：
+    - 尝试按文本解析每行内的整数（十进制或 0x 十六进制），将其视为 edge id。
+    - 若文本解析失败且文件为二进制，则按字节位图解析：每个非零字节的位置视为被命中 edge。
     """
     cov = CoverageData()
     if not os.path.exists(path):
         return cov
 
-    if os.path.isdir(path):
-        for fn in os.listdir(path):
-            if fn.endswith(".cover") or fn.endswith(".cov") or fn.endswith(".txt"):
-                p = os.path.join(path, fn)
-                _parse_text_file_into(p, cov)
-        return cov
-
-    # 单文件解析尝试
-    _parse_text_file_into(path, cov)
-    return cov
-
-
-def _parse_text_file_into(path: str, cov: CoverageData) -> None:
+    # 优先尝试文本解析
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            any_found = False
             for line in f:
                 line = line.strip()
-                # 常见风格： '  filename:lineno: ...' 或 'filename: lineno: ...'
-                parts = line.split(":")
-                if len(parts) >= 2:
-                    fname = parts[0].strip()
+                if not line:
+                    continue
+                # 提取行中出现的十进制或 0x 十六进制的整数
+                parts = line.replace(',', ' ').split()
+                for p in parts:
                     try:
-                        ln = int(parts[1].strip())
-                        cov.add(fname, ln)
-                        continue
+                        if p.startswith("0x") or p.startswith("0X"):
+                            val = int(p, 16)
+                        else:
+                            val = int(p)
+                        cov.add_edge(val)
+                        any_found = True
                     except Exception:
-                        pass
-                # 无法解析则跳过
+                        continue
+            if any_found:
+                return cov
     except Exception:
-        return
+        pass
 
+    # 文本解析未发现内容，尝试二进制位图解析
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+            for i, b in enumerate(data):
+                if b != 0:
+                    cov.add_edge(i)
+    except Exception:
+        pass
 
-__all__ = ["CoverageData", "parse_trace_count_file"]
+    return cov
+__all__ = ["CoverageData", "parse_afl_map"]

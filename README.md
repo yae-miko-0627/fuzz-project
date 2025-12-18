@@ -91,3 +91,13 @@ ovelty（新增覆盖点数）和累计覆盖。
 - 动机与效果：
 	- 使调度器能更直接地把“发现新覆盖位点”的反馈转化为更多尝试资源，从而在没有完整 AFL 位图接入前也能提高探索效率；
 	- 在本地快速验证（`quick_sched_test.py`）中已确认：当 `coverage_new` 为正时，样本会被提升能量并保留在语料中，语料池条目统计（`hits`/`avg_exec_time`）正确更新。
+
+## AFL++ 适配变更日志（摘要）
+
+2025-12-17 至 2025-12-18：为更好复用 AFL++ 的插装与种子能力，对 MiniAFL 做了下列适配与精简：
+
+- 移除 Python 原生的 trace/text 覆盖解析与源码级覆盖结构，统一采用 AFL edge-id/bitmap 表示，避免重复实现带来的差异。
+- 新增 AFL map 解析器：`mini_afl_py/instrumentation/coverage.py` 提供 `parse_afl_map()`，可解析 `afl-showmap` 的文本或二进制输出为 `CoverageData`（edge id 集合）。
+- 精简编译辅助：`mini_afl_py/instrumentation/assembler.py` 仅保留 `afl_cc_command(...)` 用于构造 `afl-cc` 编译命令，上层负责在容器/主机上执行该命令（不在库内执行编译）。
+- 目标运行器适配：`mini_afl_py/targets/command_target.py` 在 `DEFAULTS['instrumentation_mode']=='afl'` 时，优先通过 `afl-showmap` 执行目标并把 map 解析结果附加到 `CommandTargetResult.coverage`。
+- 调度器改造：`mini_afl_py/core/scheduler.py` 增加累计覆盖集合并在 `report_result()` 中基于 `result.coverage` 计算 novelty（新增 edge 数）以调整能量分配与语料加入策略。

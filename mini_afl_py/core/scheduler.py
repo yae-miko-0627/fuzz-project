@@ -13,6 +13,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import random
+from ..instrumentation.coverage import CoverageData
 
 
 @dataclass
@@ -50,6 +51,8 @@ class Scheduler:
         self._next_id = 1
         self._corpus: Dict[int, Candidate] = {}
         self._queue: List[int] = []
+        # 累计覆盖（AFL edge id 集合），用于计算 novelty
+        self.cumulative_cov = CoverageData()
 
     def add_seed(self, seed: bytes, energy: int = 1) -> int:
         """将种子加入语料池并返回分配的 id。"""
@@ -128,7 +131,18 @@ class Scheduler:
         返回新加入样本的 id（若未加入返回 None）。
         """
         status = getattr(result, "status", None)
-        novelty = getattr(result, 'coverage_new', 0) or getattr(result, 'novelty', 0)
+        # 优先从 result.coverage 获取 AFL 风格的 CoverageData
+        novelty = 0
+        cov = getattr(result, "coverage", None)
+        if cov and isinstance(cov, CoverageData):
+            # 计算新颖点：cov.points - cumulative_cov.points
+            try:
+                new_points = set(cov.points) - set(self.cumulative_cov.points)
+                novelty = len(new_points)
+                # 合并到累计覆盖
+                self.cumulative_cov.merge(cov)
+            except Exception:
+                novelty = 0
 
         # 若样本已在语料池中，则更新其统计（exec time、hits、energy）
         for cid, cand in list(self._corpus.items()):
@@ -146,7 +160,8 @@ class Scheduler:
                 cand.hits += 1
                 # 若观察到新覆盖位点（novelty），提升能量
                 if novelty and novelty > 0:
-                    boost = int(2 + novelty)  # 简单映射：novelty 1 -> +3 energy
+                    # 根据发现的新 edge 数给予能量奖励（经验映射）
+                    boost = int(2 + novelty)
                     cand.energy = max(cand.energy, cand.energy + boost)
                 # crash/hang 获得更高能量保障
                 if status in ("crash", "hang"):
@@ -161,7 +176,8 @@ class Scheduler:
             cid = self.add_seed(sample, energy=max(12, int(1 + novelty * 3)))
             return cid
         if novelty and novelty > 0:
-            cid = self.add_seed(sample, energy=max(12, int(1 + novelty * 3)))
+            # 新颖样本加入语料并分配基于 novelty 的能量
+            cid = self.add_seed(sample, energy=max(6, int(1 + novelty * 3)))
             return cid
         if random.random() < 0.01:
             cid = self.add_seed(sample, energy=1)
