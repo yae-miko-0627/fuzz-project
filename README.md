@@ -101,3 +101,15 @@ ovelty（新增覆盖点数）和累计覆盖。
 - 精简编译辅助：`mini_afl_py/instrumentation/assembler.py` 仅保留 `afl_cc_command(...)` 用于构造 `afl-cc` 编译命令，上层负责在容器/主机上执行该命令（不在库内执行编译）。
 - 目标运行器适配：`mini_afl_py/targets/command_target.py` 在 `DEFAULTS['instrumentation_mode']=='afl'` 时，优先通过 `afl-showmap` 执行目标并把 map 解析结果附加到 `CommandTargetResult.coverage`。
 - 调度器改造：`mini_afl_py/core/scheduler.py` 增加累计覆盖集合并在 `report_result()` 中基于 `result.coverage` 计算 novelty（新增 edge 数）以调整能量分配与语料加入策略。
+
+## 实现日志：Python SHM 管理器（`shm_manager.py`，2025-12-18）
+
+2025-12-18：实现基于 System V 共享内存的 Python 管理器 `mini_afl_py/instrumentation/shm_manager.py` ，并把项目默认插装改为 `shm_py`（Python 创建 SHM，AFL++ 插装向 SHM 写位图，Python 读取位图并解析为 `CoverageData`）。
+
+- 目的：摆脱对 `afl-showmap` 的依赖，直接使用与 AFL 插装 runtime 相同的共享内存位图机制，以降低开销并更好地与自定义调度器集成。
+
+- 主要实现内容：
+	- `shm_manager.py`：通过 ctypes 调用 libc 的 `shmget`/`shmat`/`shmdt`/`shmctl` 创建并读取 System V SHM（默认 65536 字节），将 `__AFL_SHM_ID` 注入子进程环境，运行目标，结束后把位图写入 `map_out` 文件。
+	- `CommandTarget`：新增 `instrumentation_mode == 'shm_py'` 的执行路径，使用 `run_target_with_shm()` 启动目标并在返回后用 `parse_afl_map()` 解析位图为 `CoverageData`。
+	- `utils/config.py`：默认 `instrumentation_mode` 改为 `shm_py`。
+	- `MiniFuzzer`：新增 `use_shm` 参数，默认启用，确保 fuzz 循环默认走 SHM 流程。

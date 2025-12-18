@@ -16,6 +16,7 @@ import time
 from typing import List, Optional
 from ..utils.config import DEFAULTS
 from ..instrumentation.coverage import parse_afl_map, CoverageData
+from ..instrumentation.shm_manager import run_target_with_shm
 
 
 @dataclass
@@ -89,9 +90,8 @@ class CommandTarget:
             with open(input_path, "wb") as f:
                 f.write(input_data)
 
-        # 如果配置为使用 AFL++ 的 showmap 作为插装/覆盖来源，优先走 afl-showmap 路径
+        # 插装模式（当前仅支持 'shm_py' 或 'none'）
         instr_mode = DEFAULTS.get("instrumentation_mode")
-        afl_showmap = DEFAULTS.get("afl_showmap_path", "afl-showmap")
         map_out = os.path.join(run_workdir, "afl_showmap.out")
 
         # 构造命令行
@@ -106,19 +106,16 @@ class CommandTarget:
 
         start = time.time()
         try:
-            # 若使用 AFL showmap，则通过 afl-showmap 启动目标并生成 map 文件
-            if instr_mode == "afl":
-                # 使用 afl-showmap wrapper： afl-showmap -q -o map_out -- <cmd> [input]
-                showmap_cmd = [afl_showmap, "-q", "-o", map_out, "--"] + cmd
-                if mode == "file" and input_path is not None:
-                    showmap_cmd = showmap_cmd + [input_path]
-                proc = subprocess.Popen(showmap_cmd,
-                                        stdin=subprocess.PIPE if mode == "stdin" else None,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
-                                        cwd=run_workdir,
-                                        preexec_fn=preexec_fn)
+            # 使用 Python SHM 管理器（shm_py）创建 System V SHM 并运行目标
+            if instr_mode == "shm_py":
+                exit_code, timed_out, out, err, map_out_path = run_target_with_shm(cmd,
+                                                                                   input_data=input_data,
+                                                                                   mode=mode,
+                                                                                   timeout=timeout,
+                                                                                   workdir=run_workdir,
+                                                                                   map_out=map_out)
             else:
+                # 默认直接执行目标子进程（无覆盖采集）
                 proc = subprocess.Popen(cmd,
                                         stdin=subprocess.PIPE if mode == "stdin" else None,
                                         stdout=subprocess.PIPE,
@@ -126,33 +123,33 @@ class CommandTarget:
                                         cwd=run_workdir,
                                         preexec_fn=preexec_fn)
 
-            # 3) 发送输入（stdin 模式）并等待结果，处理超时
-            try:
-                out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                # 超时：先尝试终止，再强杀整个进程组
+                # 发送输入（stdin 模式）并等待结果，处理超时
                 try:
-                    if use_preexec:
-                        os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
-                    else:
-                        proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    out, err = proc.communicate(timeout=0.5)
-                except Exception:
+                    out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    # 超时：先尝试终止，再强杀整个进程组
                     try:
                         if use_preexec:
-                            os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+                            os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
                         else:
-                            proc.kill()
+                            proc.terminate()
                     except Exception:
                         pass
-                    out, err = proc.communicate()
+                    try:
+                        out, err = proc.communicate(timeout=0.5)
+                    except Exception:
+                        try:
+                            if use_preexec:
+                                os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+                            else:
+                                proc.kill()
+                        except Exception:
+                            pass
+                        out, err = proc.communicate()
 
-            exit_code = proc.returncode
+                exit_code = proc.returncode
         except Exception as e:
             # 启动失败视为 error
             end = time.time()
@@ -194,9 +191,12 @@ class CommandTarget:
                                      wall_time=wall_time,
                                      artifact_path=artifact_path)
 
-        # 如果有 afl_showmap 输出文件，尝试解析并把 CoverageData 放入 result.coverage
+        # 如果有 afl_showmap 或 shm_py 输出文件，尝试解析并把 CoverageData 放入 result.coverage
         try:
             if instr_mode == "afl" and os.path.exists(map_out):
+                cov = parse_afl_map(map_out)
+                result.coverage = cov
+            if instr_mode == "shm_py" and os.path.exists(map_out):
                 cov = parse_afl_map(map_out)
                 result.coverage = cov
         except Exception:
