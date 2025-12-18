@@ -14,6 +14,8 @@ import tempfile
 import os
 import time
 from typing import List, Optional
+from ..utils.config import DEFAULTS
+from ..instrumentation.coverage import parse_afl_map, CoverageData
 
 
 @dataclass
@@ -36,6 +38,8 @@ class CommandTargetResult:
     stderr: Optional[bytes] = None
     wall_time: float = 0.0
     artifact_path: Optional[str] = None
+    # 可选的覆盖信息（由 instrumentation 提供），通常为 CoverageData
+    coverage: Optional[object] = None
 
 
 class CommandTarget:
@@ -85,6 +89,11 @@ class CommandTarget:
             with open(input_path, "wb") as f:
                 f.write(input_data)
 
+        # 如果配置为使用 AFL++ 的 showmap 作为插装/覆盖来源，优先走 afl-showmap 路径
+        instr_mode = DEFAULTS.get("instrumentation_mode")
+        afl_showmap = DEFAULTS.get("afl_showmap_path", "afl-showmap")
+        map_out = os.path.join(run_workdir, "afl_showmap.out")
+
         # 构造命令行
         cmd = list(self.cmd) + extra_args
         if mode == "file" and input_path is not None:
@@ -97,12 +106,25 @@ class CommandTarget:
 
         start = time.time()
         try:
-            proc = subprocess.Popen(cmd,
-                                    stdin=subprocess.PIPE if mode == "stdin" else None,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    cwd=run_workdir,
-                                    preexec_fn=preexec_fn)
+            # 若使用 AFL showmap，则通过 afl-showmap 启动目标并生成 map 文件
+            if instr_mode == "afl":
+                # 使用 afl-showmap wrapper： afl-showmap -q -o map_out -- <cmd> [input]
+                showmap_cmd = [afl_showmap, "-q", "-o", map_out, "--"] + cmd
+                if mode == "file" and input_path is not None:
+                    showmap_cmd = showmap_cmd + [input_path]
+                proc = subprocess.Popen(showmap_cmd,
+                                        stdin=subprocess.PIPE if mode == "stdin" else None,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        cwd=run_workdir,
+                                        preexec_fn=preexec_fn)
+            else:
+                proc = subprocess.Popen(cmd,
+                                        stdin=subprocess.PIPE if mode == "stdin" else None,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        cwd=run_workdir,
+                                        preexec_fn=preexec_fn)
 
             # 3) 发送输入（stdin 模式）并等待结果，处理超时
             try:
@@ -171,5 +193,13 @@ class CommandTarget:
                                      stderr=err,
                                      wall_time=wall_time,
                                      artifact_path=artifact_path)
+
+        # 如果有 afl_showmap 输出文件，尝试解析并把 CoverageData 放入 result.coverage
+        try:
+            if instr_mode == "afl" and os.path.exists(map_out):
+                cov = parse_afl_map(map_out)
+                result.coverage = cov
+        except Exception:
+            pass
         return result
 
