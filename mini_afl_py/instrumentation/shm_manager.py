@@ -47,7 +47,6 @@ IPC_RMID = 0
 def create_shm(size: int = MAP_SIZE) -> int:
     """创建 System V 共享内存段并返回其 shmid（整数）。
 
-    注释：
     - 使用 IPC_PRIVATE 表示内核分配一个新的、唯一的共享内存段（匿名、不可预测的 key），
       这对于每次运行都使用独立 SHM 的场景非常合适，避免与其他进程冲突。
     - 权限采用 0600（仅当前用户可读写），以降低跨用户访问风险。
@@ -100,11 +99,6 @@ def remove_shm(shmid: int) -> None:
 def run_target_with_shm(cmd: list, input_data: Optional[bytes] = None,
                         mode: str = "stdin", timeout: Optional[float] = None,
                         workdir: Optional[str] = None, map_out: Optional[str] = None) -> Tuple[int, bool, bytes, bytes, Optional[str]]:
-    """
-    Create SHM, set __AFL_SHM_ID, run cmd and dump SHM to map_out.
-
-    Returns: (exit_code, timed_out, stdout, stderr, map_out_path)
-    """
     # 1) 创建共享内存并把 shmid 注入到子进程的环境变量中
     #    AFL 插装运行时会读取 __AFL_SHM_ID 并把位图写入对应的共享内存段。
     shmid = create_shm(MAP_SIZE)
