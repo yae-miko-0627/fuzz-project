@@ -32,13 +32,13 @@ class MiniFuzzer:
             use_shm: 是否使用 Python SHM 管理（默认 True，用于与 `afl-cc` 插装配合）
     """
 
-        def __init__(self, target_cmd: List[str], timeout: float = 1.0, workdir: Optional[str] = None,
+    def __init__(self, target_cmd: List[str], timeout: float = 1.0, workdir: Optional[str] = None,
                                  use_shm: bool = True):
-                # 默认使用 Python SHM 管理（shm_py）以配合 afl-cc 插装
-                if use_shm:
-                        DEFAULTS["instrumentation_mode"] = "shm_py"
-                else:
-                        DEFAULTS["instrumentation_mode"] = "none"
+        # 默认使用 Python SHM 管理（shm_py）以配合 afl-cc 插装
+        if use_shm:
+            DEFAULTS["instrumentation_mode"] = "shm_py"
+        else:
+            DEFAULTS["instrumentation_mode"] = "none"
 
         self.scheduler = Scheduler()
         self.monitor = Monitor()
@@ -53,10 +53,13 @@ class MiniFuzzer:
         self.timeout = timeout
 
     def add_seed(self, data: bytes) -> int:
-        return self.scheduler.add_seed(data)
+        sid = self.scheduler.add_seed(data)
+        print(f"[MiniFuzzer] add_seed id={sid} len={len(data)}")
+        return sid
 
     def _execute_sample(self, sample: bytes, parent_id: Optional[int]) -> Optional[int]:
         """执行一次样本并把结果上报到 scheduler 和 monitor。返回新加入的 sample id（若有）。"""
+        print(f"[MiniFuzzer] exec_sample parent={parent_id} len={len(sample)}")
         res: CommandTargetResult = self.target.run(sample, mode="stdin", timeout=self.timeout)
 
         # 报告给 scheduler（可能返回新加入的 id）
@@ -67,11 +70,13 @@ class MiniFuzzer:
         cov = getattr(res, "coverage", None)
         self.monitor.record_run(sample_id, sample, res.status, res.wall_time, cov=cov,
                                artifact_path=res.artifact_path)
+        print(f"[MiniFuzzer] result sample_id={sample_id} status={res.status} wall_time={res.wall_time:.4f}")
         return new_id
 
     def run(self, run_time: float = 10.0) -> None:
         """主循环：在指定时间内反复选取候选并对其应用变异与执行。"""
         start = time.time()
+        print(f"[MiniFuzzer] start run_time={run_time}")
         # 保证 splice 的语料来源与 scheduler 的语料同步
         while time.time() - start < run_time:
             cand = self.scheduler.next_candidate()
@@ -108,7 +113,11 @@ class MiniFuzzer:
                         self._execute_sample(s, cand.id)
                         break
                 if time.time() - start >= run_time:
+                    print("[MiniFuzzer] run timeout, exiting")
+                    print(f"[MiniFuzzer] end elapsed={time.time()-start:.4f}")
                     return
+
+        print(f"[MiniFuzzer] end elapsed={time.time()-start:.4f}")
 
 
 __all__ = ["MiniFuzzer"]

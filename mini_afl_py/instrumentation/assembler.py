@@ -1,7 +1,6 @@
 """AFL++ 编译命令生成器（最小实现，仅构造 afl-cc 命令）。
 
 该模块仅提供用于生成 `afl-cc` 编译命令的函数，调用方负责在适当环境
-（容器或主机）上执行该命令。移除所有运行时包装和 Python trace 回退逻辑。
 """
 
 from __future__ import annotations
