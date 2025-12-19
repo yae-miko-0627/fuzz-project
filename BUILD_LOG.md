@@ -116,3 +116,23 @@ ovelty（新增覆盖点数）和累计覆盖。
 	- `MiniFuzzer`：新增 `use_shm` 参数，默认启用，确保 fuzz 循环默认走 SHM 流程。
 
 ````
+## Build Log — MiniAFL Docker + AFL++ 集成 ##(2025-12-19)
+
+- **概述**: 本次工作目标是在容器中准备 AFL++ 并将 `MiniAFL` Python 层与 `afl-cc` / AFL++ 工具链整合、可运行一个短时 demo。主要产出为调整镜像构建脚本与入口脚本，以减少运行时依赖和常见故障。
+
+**遇到的问题**
+- **System V SHM 资源耗尽**：容器内存在大量残留的共享内存段，导致 `shmget()` 返回 "No space left on device"，阻止 AFL++ 内部测试/运行。
+- **缺失构建依赖**：初次构建时缺少 zlib、LLVM headers、libclang、gcc-plugin-dev 等，导致 `afl-cc` 无法正确构建或出现 "no compiler mode available"。
+- **镜像构建时的可变性**：有时在构建阶段无法完成 AFL++ 编译，需在容器运行时做补救。
+
+**已执行的修复与更改（关键点）**
+- 在 [MiniAFL/scripts/docker/Dockerfile.ubuntu22](MiniAFL/scripts/docker/Dockerfile.ubuntu22#L1) 中新增/调整：安装如下构建依赖以保证 AFL++ 能编译（示例）: `zlib1g-dev`, `liblzma-dev`, `llvm-14-dev`, `libclang-14-dev`, `gcc-11-plugin-dev`, `lld` 等。
+- 在镜像构建阶段做一次浅克隆/浅构建（best-effort），并把 AFL++ 源拷贝到 `/opt/afl/AFLplusplus-stable`，以便在 entrypoint 中做补建或调试。
+- 在 [MiniAFL/scripts/docker/entrypoint.sh](MiniAFL/scripts/docker/entrypoint.sh#L1) 中增加：
+  - 启动时清理 System V 共享内存段（使用 `ipcs -m` + `ipcrm -m`）。
+  - AFL++ 构建回退逻辑：优先调用 Python helper `mini_afl_py.utils.afl_tools.ensure_afl_built()`（若可用），失败则在 shell 中对 `/workspace/AFLplusplus-stable` 执行 `make`（或 `make` 的回退），并把生成的二进制复制到 `/opt/afl` 并加入 `PATH`。
+  - 编译 demo 时更加稳健：若无 `afl-cc` 则回退为 `gcc`，避免容器立即失败。
+
+**结果与产物**
+- AFL++ 在修复系统依赖并清理 shm 后可成功构建（构建日志在容器 `/tmp/afl_make.log`）。
+- demo 可通过 `afl-cc` 编译并用 `MiniAFL` Python runner 运行（运行日志保存在容器 `/tmp/run_minifuzzer.log`）。
