@@ -113,4 +113,16 @@ ovelty（新增覆盖点数）和累计覆盖。
 	- `shm_manager.py`：通过 ctypes 调用 libc 的 `shmget`/`shmat`/`shmdt`/`shmctl` 创建并读取 System V SHM（默认 65536 字节），将 `__AFL_SHM_ID` 注入子进程环境，运行目标，结束后把位图写入 `map_out` 文件。
 	- `CommandTarget`：新增 `instrumentation_mode == 'shm_py'` 的执行路径，使用 `run_target_with_shm()` 启动目标并在返回后用 `parse_afl_map()` 解析位图为 `CoverageData`。
 	- `utils/config.py`：默认 `instrumentation_mode` 改为 `shm_py`。
-	- `MiniFuzzer`：新增 `use_shm` 参数，默认启用，确保 fuzz 循环默认走 SHM 流程。
+	- `MiniFuzzer`：新增 `use_shm` 参数，默认启用，确保 fuzz 循环默认走 SHM 流程.
+
+## AFL-cc 整合测试准备（2025-12-21）
+
+2025-12-21：为配合 AFL++ 的 `afl-cc` 插装能力并在 Ubuntu 22.04 容器中运行测试，完成如下准备工作：
+
+- 新增 `mini_afl_py/fuzzer.py`：
+	- 位置：`MiniAFL/mini_afl_py/fuzzer.py`。
+	- 功能：可选调用 `afl-cc` 编译源文件（或直接使用已插装二进制），加载种子目录并在简单循环中调用 `CommandTarget` 执行样本；使用 `Monitor` 收集执行记录并周期性导出 `coverage_curve.csv` 与 `monitor_records.json`。
+
+- 在 `MiniAFL/` 目录下新增 `Dockerfile`：
+	- 位置：`MiniAFL/Dockerfile`（确保镜像构建上下文为 `MiniAFL`，以便相对路径与示例文件可用）。
+	- 功能：基于 `ubuntu:22.04`，安装构建与运行依赖、克隆并编译 AFL++，把仓库内容复制到容器 `/fuzz`，并提供交互 shell 作为默认入口。可在运行命令中编译目标并调用 `fuzzer.py` 进行 smoke 测试。
