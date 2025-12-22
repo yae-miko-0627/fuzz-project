@@ -126,3 +126,19 @@ ovelty（新增覆盖点数）和累计覆盖。
 - 在 `MiniAFL/` 目录下新增 `Dockerfile`：
 	- 位置：`MiniAFL/Dockerfile`（确保镜像构建上下文为 `MiniAFL`，以便相对路径与示例文件可用）。
 	- 功能：基于 `ubuntu:22.04`，安装构建与运行依赖、克隆并编译 AFL++，把仓库内容复制到容器 `/fuzz`，并提供交互 shell 作为默认入口。可在运行命令中编译目标并调用 `fuzzer.py` 进行 smoke 测试。
+
+	## 使用 `AFLplusplus-stable/test-instr.c` 的 Smoke 测试（2025-12-22）
+
+	2025-12-22：在构建完成的 `miniafl:latest` 容器内，使用仓库中的 `AFLplusplus-stable/test-instr.c` 作为被测程序执行了一次短时（~12s）smoke 测试，记录如下：
+
+	- 操作步骤：
+		- 在宿主 `fuzz` 目录将整个仓库挂载到容器 `/workspace`；
+		- 使用 `afl-cc -g -O0 -o /workspace/MiniAFL/target_testinstr /workspace/AFLplusplus-stable/test-instr.c` 编译插装二进制；
+		- 运行 `python3 /workspace/MiniAFL/mini_afl_py/fuzzer.py --out /workspace/MiniAFL/target_testinstr --seeds /workspace/MiniAFL/seeds --time 12 --outdir /workspace/MiniAFL/fuzz_out_testinstr`。
+
+	- 关键结果摘要：
+		- 测试时长：约 12 秒（实际 11.99s）；
+		- 执行次数：1181 次（`sample_id` 最高为 1180）；
+		- 吞吐率：约 95–100 exec/s（平均 wall_time ~0.0065s）；
+		- 覆盖：首次执行产生 `novelty=6`，累计覆盖稳定为 6（`coverage_curve.csv` 全程为 6）；
+		- 异常：无 `crash` 或 `hang`；首个带来新覆盖的样本已保存到 artifact（路径位于 `MiniAFL/fuzz_out_testinstr`）。
