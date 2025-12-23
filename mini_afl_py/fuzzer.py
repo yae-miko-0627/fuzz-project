@@ -22,6 +22,8 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+import threading
+import sys
 
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parents[1]
@@ -58,12 +60,36 @@ def load_seeds(seeds_dir: str) -> List[bytes]:
 
 
 def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
-                     time_limit: float = 60.0, mode: str = "stdin", timeout: float = 1.0) -> None:
+                     time_limit: float = 60.0, mode: str = "stdin", timeout: float = 1.0,
+                     status_interval: float = 5.0) -> None:
     monitor = Monitor(out_dir=out_dir)
     target = CommandTarget(cmd, workdir=None, timeout_default=timeout)
 
     start = time.time()
-    iter_count = 0
+    iter_count = [0]
+    iter_lock = threading.Lock()
+
+    stop_ev = threading.Event()
+
+    def _status_printer():
+        while not stop_ev.wait(status_interval):
+            with iter_lock:
+                iters = iter_count[0]
+            elapsed = time.time() - start
+            rate = iters / elapsed if elapsed > 0 else 0.0
+            seeds_count = len(seeds)
+            new_paths = len(monitor.cumulative_cov.points)
+            crashes = sum(1 for r in monitor.records if r.status == "crash")
+            line = (f"[status] elapsed={elapsed:.1f}s execs={iters} rate={rate:.1f}/s "
+                    f"seeds={seeds_count} new_paths={new_paths} crashes={crashes}")
+            sys.stdout.write("\x1b[2K\r" + line)
+            sys.stdout.flush()
+
+    printer_thr = None
+    if status_interval and status_interval > 0:
+        printer_thr = threading.Thread(target=_status_printer, daemon=True)
+        printer_thr.start()
+
     try:
         while True:
             if time.time() - start >= time_limit:
@@ -76,18 +102,28 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
                 if hasattr(res, "coverage") and isinstance(res.coverage, CoverageData):
                     cov = res.coverage
 
-                monitor.record_run(sample_id=iter_count, sample=s, status=res.status,
+                monitor.record_run(sample_id=iter_count[0], sample=s, status=res.status,
                                    wall_time=res.wall_time, cov=cov,
                                    artifact_path=res.artifact_path)
 
-                iter_count += 1
+                with iter_lock:
+                    iter_count[0] += 1
                 # 每 N 次导出一次覆盖曲线
-                if iter_count % 50 == 0:
+                if iter_count[0] % 50 == 0:
                     curve = coverage_curve(monitor)
                     csvp = os.path.join(out_dir, "coverage_curve.csv")
                     export_curve_csv(curve, csvp)
     except KeyboardInterrupt:
         print("[fuzzer] interrupted by user")
+
+    # 通知状态线程退出并换行
+    if printer_thr is not None:
+        stop_ev.set()
+        try:
+            printer_thr.join(timeout=1.0)
+        except Exception:
+            pass
+    sys.stdout.write("\n")
 
     # 最终导出记录与覆盖曲线
     os.makedirs(out_dir, exist_ok=True)
@@ -95,7 +131,16 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
     curve = coverage_curve(monitor)
     csvp = os.path.join(out_dir, "coverage_curve.csv")
     export_curve_csv(curve, csvp)
-    print(f"[fuzzer] finished. records: {rec_path}, coverage: {csvp}")
+    # 统计信息
+    total_execs = iter_count[0]
+    new_paths = len(monitor.cumulative_cov.points)
+    crashes = sum(1 for r in monitor.records if r.status == "crash")
+
+    print(f"=====[fuzzer] finished.=====")
+    print(f"  total executions: {total_execs}")
+    print(f"  new paths: {new_paths}")
+    print(f"  crashes: {crashes}")
+    print(f"  records saved to: {rec_path}")
 
 
 def main():
@@ -104,7 +149,9 @@ def main():
     p.add_argument("--out", help="output binary path when using --compile", default=None)
     p.add_argument("--afl-cc", help="path to afl-cc", default=DEFAULTS.get("afl_cc_path", "afl-cc"))
     p.add_argument("--cmd", help="command to run (if provided, used instead of --out)", default=None)
+    p.add_argument("--target", help="(T01) path to target binary (alias for --out/--cmd)", default=None)
     p.add_argument("--seeds", help="seeds directory", required=True)
+    p.add_argument("--status-interval", help="status print interval seconds (0 to disable)", type=float, default=5.0)
     p.add_argument("--time", help="fuzz time seconds", type=float, default=DEFAULTS.get("fuzz_time", 60))
     p.add_argument("--mode", help="input mode: stdin|file", choices=["stdin", "file"], default="stdin")
     p.add_argument("--timeout", help="per-run timeout seconds", type=float, default=1.0)
@@ -118,19 +165,23 @@ def main():
             raise SystemExit("--out is required when --compile is used")
         run_afl_cc(args.compile, args.out, afl_cc_cmd=args.afl_cc)
 
-    # 确定最终要执行的命令
+    # 确定最终要执行的命令（支持 --target 作为 T01 便捷参数）
+    final_cmd = None
     if args.cmd:
-        cmd = args.cmd.split()
+        final_cmd = args.cmd.split()
+    elif args.target:
+        final_cmd = [str(args.target)]
     elif args.out:
-        cmd = [str(args.out)]
+        final_cmd = [str(args.out)]
     else:
-        raise SystemExit("either --cmd or --out must be provided")
+        raise SystemExit("either --cmd, --target or --out must be provided")
 
     # 加载种子
     seeds = load_seeds(args.seeds)
 
     os.makedirs(args.outdir, exist_ok=True)
-    simple_fuzz_loop(cmd, seeds, out_dir=args.outdir, time_limit=args.time, mode=args.mode, timeout=args.timeout)
+    simple_fuzz_loop(final_cmd, seeds, out_dir=args.outdir, time_limit=args.time, mode=args.mode, timeout=args.timeout,
+                     status_interval=args.status_interval)
 
 
 if __name__ == "__main__":
