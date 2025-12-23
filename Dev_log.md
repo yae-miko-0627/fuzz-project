@@ -127,7 +127,7 @@ ovelty（新增覆盖点数）和累计覆盖。
 	- 位置：`MiniAFL/Dockerfile`（确保镜像构建上下文为 `MiniAFL`，以便相对路径与示例文件可用）。
 	- 功能：基于 `ubuntu:22.04`，安装构建与运行依赖、克隆并编译 AFL++，把仓库内容复制到容器 `/fuzz`，并提供交互 shell 作为默认入口。可在运行命令中编译目标并调用 `fuzzer.py` 进行 smoke 测试。
 
-	## 使用 `AFLplusplus-stable/test-instr.c` 的 Smoke 测试（2025-12-22）
+## 使用 `AFLplusplus-stable/test-instr.c` 的 Smoke 测试（2025-12-22）
 
 	2025-12-22：在构建完成的 `miniafl:latest` 容器内，使用仓库中的 `AFLplusplus-stable/test-instr.c` 作为被测程序执行了一次短时（~12s）smoke 测试，记录如下：
 
@@ -142,3 +142,44 @@ ovelty（新增覆盖点数）和累计覆盖。
 		- 吞吐率：约 95–100 exec/s（平均 wall_time ~0.0065s）；
 		- 覆盖：首次执行产生 `novelty=6`，累计覆盖稳定为 6（`coverage_curve.csv` 全程为 6）；
 		- 异常：无 `crash` 或 `hang`；首个带来新覆盖的样本已保存到 artifact（路径位于 `MiniAFL/fuzz_out_testinstr`）。
+
+## 整合afl-cc的T01测试（2025-12-23）
+
+2025-12-23：对 `T01`（`cxxfilt`）的整合测试与工作流记录。
+
+- 环境准备与目录：
+	- 在宿主与容器共享工作区下创建独立测试目录 `T01`：`/fuzz/T01`，并在其中建立 `source/ build/ seeds/ output/` 四个子目录，用于源码、构建产物、初始种子和 fuzz 输出。
+	- 源码包位于 `/fuzz/MiniAFL/examples/binutils-2.28.tar.gz`，将其解压到 `/fuzz/T01/source`（宿主路径 `C:\Users\11053\Desktop\fuzz\T01\source`）。
+
+- 构建被测程序（只编译目标工具以节省时间）：
+	- 进入 `/fuzz/T01/source/binutils-2.28` 后，使用 `afl-cc` 插桩编译 `cxxfilt`：
+		- 先运行 `./configure`（使用 `CC=afl-cc CXX=afl-c++`），以生成配置文件与构建环境；
+		- 仅编译 `binutils` 子目录下的 `cxxfilt`：`make -C binutils cxxfilt`；
+		- 将生成的二进制拷贝到 `/fuzz/T01/build/cxxfilt` 并设置可执行权限。
+	- 验证：执行 `/fuzz/T01/build/cxxfilt --version`，确认输出 `GNU c++filt (GNU Binutils) 2.28`（表明构建成功且可运行）。
+
+- 种子准备：
+	- 在 `/fuzz/T01/seeds` 中创建初始种子文件 `seed1`，内容为字符串 `""Z1fv""`（用于 T01 的最小输入样例）。
+
+- MiniAFL 脚本改进（实时显示功能）：
+	- 为了方便短时交互式观察，把 `MiniAFL/mini_afl_py/fuzzer.py` 增强：
+		- 新增 `--target` 参数（T01 便捷别名），并保留原有 `--out/--cmd` 支持；
+		- 新增 `--status-interval` 参数（默认 5s），在 fuzz 运行期间以后台守护线程每隔该间隔打印一行覆盖式状态信息（使用 ANSI 清行并覆盖同一行，不持续刷屏）；
+		- 在运行结束时导出 `monitor_records.json` 和 `coverage_curve.csv`，并打印汇总：总执行次数、新路径数、崩溃数与结果路径。
+	- 状态行包含：已运行时间、总执行次数、执行速率、种子数、累计新路径数和崩溃数，便于在终端中实时观察探索进度。
+
+- 运行与结果：
+	- 所有准备操作（解压、构建 `cxxfilt`、创建种子与脚本增强）已完成，并在容器镜像 `miniafl:latest` 环境中通过语法检查；
+	- 当前已准备好可执行的短时 fuzz 命令（样例）：
+		```bash
+		cd /fuzz
+		python3 MiniAFL/mini_afl_py/fuzzer.py \
+			--target /fuzz/T01/build/cxxfilt \
+			--seeds /fuzz/T01/seeds \
+			--outdir /fuzz/T01/output \
+			--time 20 \
+			--status-interval 5
+		```
+	- 说明：上面命令在容器内运行时会每 5 秒覆盖性打印当前状态行；程序结束后会生成 `monitor_records.json` 与 `coverage_curve.csv`，并在终端打印最终统计信息。 
+	
+
