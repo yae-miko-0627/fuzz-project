@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from typing import Set
 
+BITMAP_SIZE = 65536
+
 
 class CoverageData:
     """存储整数形式 edge id 的覆盖容器（AFL 风格）。
@@ -32,65 +34,57 @@ class CoverageData:
     def __len__(self) -> int:
         return len(self.points)
 
-    def to_bitmap(self, size: int = 65536) -> bytearray:
-        """从整数 edge id 生成简易位图。
-
-        使用取模将 edge id 映射到位图索引，产生用于快速比较的紧凑表示。
-        """
+    def to_bitmap(self, size: int = BITMAP_SIZE) -> bytearray:
+        """从整数 edge id 生成简易位图（更快的本地变量/无异常路径）。"""
         bitmap = bytearray(size)
+        if not self.points:
+            return bitmap
+        b = bitmap  # local ref
         for e in self.points:
             try:
                 idx = int(e) % size
-                bitmap[idx] = 1
             except Exception:
                 continue
+            b[idx] = 1
         return bitmap
 
-def parse_afl_map(path: str) -> CoverageData:
-    """解析 afl-showmap 的输出（文本或二进制格式），返回 CoverageData。
 
-    兼容策略：
-    - 尝试按文本解析每行内的整数（十进制或 0x 十六进制），将其视为 edge id。
-    - 若文本解析失败且文件为二进制，则按字节位图解析：每个非零字节的位置视为被命中 edge。
-    """
+def parse_afl_map(path: str) -> CoverageData:
     cov = CoverageData()
     if not os.path.exists(path):
         return cov
 
-    # 优先尝试文本解析
+    # 首先按文本尝试解析（快速跳过大文件）
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            any_found = False
+            found = False
             for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                # 提取行中出现的十进制或 0x 十六进制的整数
-                parts = line.replace(',', ' ').split()
-                for p in parts:
+                for tok in line.replace(",", " ").split():
+                    if not tok:
+                        continue
                     try:
-                        if p.startswith("0x") or p.startswith("0X"):
-                            val = int(p, 16)
-                        else:
-                            val = int(p)
+                        val = int(tok, 0)  # 支持十进制与 0x 十六进制
                         cov.add_edge(val)
-                        any_found = True
+                        found = True
                     except Exception:
                         continue
-            if any_found:
+            if found:
                 return cov
     except Exception:
         pass
 
-    # 文本解析未发现内容，尝试二进制位图解析
+    # 二进制位图解析：非零字节位置即视为命中 edge
     try:
         with open(path, "rb") as f:
             data = f.read()
-            for i, b in enumerate(data):
-                if b != 0:
+            mv = memoryview(data)
+            for i, byte in enumerate(mv):
+                if byte:
                     cov.add_edge(i)
     except Exception:
         pass
 
     return cov
+
+
 __all__ = ["CoverageData", "parse_afl_map"]
