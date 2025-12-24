@@ -33,7 +33,7 @@ class RunRecord:
 class Monitor:
     """监控器：维护运行历史、累计覆盖，并保存特殊样本。"""
 
-    def __init__(self, out_dir: str = "monitor_artifacts", novelty_threshold: int = 1):
+    def __init__(self, out_dir: str = "monitor_artifacts", novelty_threshold: int = 10):
         self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
         self.records: List[RunRecord] = []

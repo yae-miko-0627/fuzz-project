@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import random
 from typing import List, Optional
 import threading
 import sys
@@ -71,6 +72,28 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
 
     stop_ev = threading.Event()
 
+    # 最小变异器：对原始种子进行简单的随机字节变异（byte flip/insert/delete）
+    def mutate(data: bytes) -> bytes:
+        if not data:
+            # 生成一个小随机输入
+            return bytes([random.randint(1, 255) for _ in range(8)])
+
+        b = bytearray(data)
+        ops = ["flip", "insert", "delete"]
+        # 每次随机 1-3 次变异
+        for _ in range(random.randint(1, 3)):
+            op = random.choice(ops)
+            if op == "flip" and len(b) > 0:
+                idx = random.randrange(len(b))
+                b[idx] = b[idx] ^ (1 << random.randint(0, 7))
+            elif op == "insert":
+                idx = random.randrange(len(b) + 1)
+                b.insert(idx, random.randint(1, 255))
+            elif op == "delete" and len(b) > 1:
+                idx = random.randrange(len(b))
+                del b[idx]
+        return bytes(b)
+
     # 新增：计算覆盖率百分比（基于已发现路径数/65536）
     def _cov_percent():
         return min(100.0, 100.0 * len(monitor.cumulative_cov.points) / 65536.0)
@@ -102,13 +125,14 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
                 break
             for i, s in enumerate(seeds):
                 st = time.time()
-                res = target.run(s, mode=mode, timeout=timeout)
-                # res.coverage 可能为 CoverageData
+                # 生成变异样本而非仅重放原始种子
+                sample = mutate(s)
+                res = target.run(sample, mode=mode, timeout=timeout)
                 cov = None
                 if hasattr(res, "coverage") and isinstance(res.coverage, CoverageData):
                     cov = res.coverage
 
-                monitor.record_run(sample_id=iter_count[0], sample=s, status=res.status,
+                monitor.record_run(sample_id=iter_count[0], sample=sample, status=res.status,
                                    wall_time=res.wall_time, cov=cov,
                                    artifact_path=res.artifact_path)
 
@@ -161,7 +185,6 @@ def main():
     p.add_argument("--seeds", help="seeds directory", required=True)
     p.add_argument("--status-interval", help="status print interval seconds (0 to disable)", type=float, default=5.0)
     p.add_argument("--time", help="fuzz time seconds", type=float, default=DEFAULTS.get("fuzz_time", 60))
-    # 新增缺失参数
     p.add_argument("--mode", help="input mode: stdin|file", choices=["stdin", "file"], default="stdin")
     p.add_argument("--timeout", help="per-run timeout seconds", type=float, default=1.0)
     p.add_argument("--outdir", help="output artifacts dir", default="fuzz_artifacts")
