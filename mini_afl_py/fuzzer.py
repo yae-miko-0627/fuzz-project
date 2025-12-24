@@ -71,6 +71,10 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
 
     stop_ev = threading.Event()
 
+    # 新增：计算覆盖率百分比（基于已发现路径数/65536）
+    def _cov_percent():
+        return min(100.0, 100.0 * len(monitor.cumulative_cov.points) / 65536.0)
+
     def _status_printer():
         while not stop_ev.wait(status_interval):
             with iter_lock:
@@ -79,9 +83,11 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
             rate = iters / elapsed if elapsed > 0 else 0.0
             seeds_count = len(seeds)
             new_paths = len(monitor.cumulative_cov.points)
+            cov_pct = _cov_percent()
             crashes = sum(1 for r in monitor.records if r.status == "crash")
             line = (f"[status] elapsed={elapsed:.1f}s execs={iters} rate={rate:.1f}/s "
-                    f"seeds={seeds_count} new_paths={new_paths} crashes={crashes}")
+                    f"seeds={seeds_count} new_paths={new_paths} cov={cov_pct:.2f}% "
+                    f"crashes={crashes}")
             sys.stdout.write("\x1b[2K\r" + line)
             sys.stdout.flush()
 
@@ -134,11 +140,13 @@ def simple_fuzz_loop(cmd: List[str], seeds: List[bytes], out_dir: str,
     # 统计信息
     total_execs = iter_count[0]
     new_paths = len(monitor.cumulative_cov.points)
+    cov_pct = _cov_percent()
     crashes = sum(1 for r in monitor.records if r.status == "crash")
 
     print(f"=====[fuzzer] finished.=====")
     print(f"  total executions: {total_execs}")
     print(f"  new paths: {new_paths}")
+    print(f"  coverage: {cov_pct:.2f}%")
     print(f"  crashes: {crashes}")
     print(f"  records saved to: {rec_path}")
 
@@ -153,19 +161,20 @@ def main():
     p.add_argument("--seeds", help="seeds directory", required=True)
     p.add_argument("--status-interval", help="status print interval seconds (0 to disable)", type=float, default=5.0)
     p.add_argument("--time", help="fuzz time seconds", type=float, default=DEFAULTS.get("fuzz_time", 60))
+    # 新增缺失参数
     p.add_argument("--mode", help="input mode: stdin|file", choices=["stdin", "file"], default="stdin")
     p.add_argument("--timeout", help="per-run timeout seconds", type=float, default=1.0)
     p.add_argument("--outdir", help="output artifacts dir", default="fuzz_artifacts")
 
     args = p.parse_args()
 
-    # 如果指定 --compile，则先用 afl-cc 编译
+    # 可选编译步骤
     if args.compile:
         if args.out is None:
             raise SystemExit("--out is required when --compile is used")
         run_afl_cc(args.compile, args.out, afl_cc_cmd=args.afl_cc)
 
-    # 确定最终要执行的命令（支持 --target 作为 T01 便捷参数）
+    # 确定最终要执行的命令
     final_cmd = None
     if args.cmd:
         final_cmd = args.cmd.split()
@@ -176,9 +185,8 @@ def main():
     else:
         raise SystemExit("either --cmd, --target or --out must be provided")
 
-    # 加载种子
+    # 加载种子并运行
     seeds = load_seeds(args.seeds)
-
     os.makedirs(args.outdir, exist_ok=True)
     simple_fuzz_loop(final_cmd, seeds, out_dir=args.outdir, time_limit=args.time, mode=args.mode, timeout=args.timeout,
                      status_interval=args.status_interval)
