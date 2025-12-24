@@ -3,13 +3,13 @@
 ## 第一步：构建容器
 借助给出的 Dockerfile 进行构建（请先熟悉 Docker）。
 ```powershell
-docker build -f Dockerfile -t miniafl:latest .
+  docker build -f Dockerfile -t miniafl:latest .
 ```
 
 ## 第二步：进入容器
 挂载宿主工作区，开启 ptrace 权限。
 ```powershell
-docker run -it --rm --name miniafl `
+  docker run -it --rm --name miniafl `
   -v "C:\Users\11053\Desktop\fuzz:/fuzz" `
   -w /fuzz `
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined `
