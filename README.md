@@ -25,7 +25,7 @@ mkdir -p /fuzz/T01/{source,build,seeds,output}
 ## 第四步：解压目标到 source
 ```bash
 cd /fuzz/T01/source
-tar -xzf /fuzz/MiniAFL/examples/binutils-2.28.tar.gz
+tar -xzf /fuzz/<target>
 ```
 
 ## 第五步：AFL 插桩编译目标（通用示例）
