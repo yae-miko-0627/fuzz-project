@@ -24,7 +24,7 @@ class ArithMutator:
         """在偏移 off 处按字节宽度 size 应用增量 delta，返回新的 bytes 或 None。
 
         说明：
-        - 使用 little-endian 进行打包/解包以保持与常见 fuzzer 行为一致。
+        - 使用小端（little-endian）进行打包/解包以保持与常见 fuzzer 行为一致。
         - 仅在字段完整（长度足够）时进行替换，否则返回 None。
         """
         slice_ = data[off:off+size]
@@ -37,7 +37,7 @@ class ArithMutator:
             out = bytearray(data)
             out[off] = new
             return bytes(out)
-        # 使用 int.from_bytes / to_bytes 提高可读性（小端 little-endian）
+        # 使用 int.from_bytes / to_bytes 提高可读性（小端）
         if size in (2, 4):
             # 从字节序列解出整数（小端）
             val = int.from_bytes(slice_, byteorder='little', signed=False)

@@ -44,7 +44,7 @@ class CommandTargetResult:
 
 
 class CommandTarget:
-    """简化版 CommandTarget。
+    """最小化的 CommandTarget 实现。
 
     参数：
     - cmd: 命令列表，例如 ['/workspace/examples/test-instr']
@@ -56,6 +56,9 @@ class CommandTarget:
 
     def __init__(self, cmd: List[str], workdir: Optional[str] = None, timeout_default: float = 1.0):
         self.cmd = cmd
+        # 与 AFL++ 保持一致：若未指定工作目录，则使用当前进程的工作目录
+        # AFL 通常在启动时将工作目录设置到被测项目工作区或临时运行目录，
+        # 这里选择更贴近 AFL 的默认行为（cwd）而不是每次新建临时目录。
         self.workdir = workdir
         self.timeout_default = timeout_default
 
@@ -75,6 +78,7 @@ class CommandTarget:
         extra_args = extra_args or []
 
         # 1) 工作目录与输入准备
+        # 若未显式指定 workdir，则为每次运行创建临时目录并在结束时清理
         tmpdir = None
         if self.workdir is None:
             tmpdir = tempfile.TemporaryDirectory(prefix="miniafl_run_")
@@ -84,7 +88,7 @@ class CommandTarget:
 
         input_path = None
         if mode == "file":
-            # 在工作目录中写入临时输入文件
+            # 在工作目录中写入临时输入文件（AFL 风格：使用文件作为输入）
             fd, input_path = tempfile.mkstemp(prefix="input_", dir=run_workdir)
             os.close(fd)
             with open(input_path, "wb") as f:
@@ -95,14 +99,26 @@ class CommandTarget:
         map_out = os.path.join(run_workdir, "afl_showmap.out")
 
         # 构造命令行
+        # 构造命令行；支持 AFL 的 "@@" 占位符：当命令中包含 "@@" 时，
+        # 用输入文件路径替换该占位符；否则行为与之前一致（把路径附加为最后一参）。
         cmd = list(self.cmd) + extra_args
         if mode == "file" and input_path is not None:
-            # 约定：把文件路径作为最后一个参数传入目标
-            cmd = cmd + [input_path]
+            replaced = False
+            for i, part in enumerate(cmd):
+                if isinstance(part, str) and "@@" in part:
+                    cmd[i] = part.replace("@@", input_path)
+                    replaced = True
+            if not replaced:
+                cmd = cmd + [input_path]
 
         # 2) 启动子进程（在 Unix 上使用 setsid 创建新进程组）
         use_preexec = hasattr(os, "setsid")
         preexec_fn = (lambda: os.setsid()) if use_preexec else None
+        # 预先初始化可能在异常路径中被引用的变量，避免 NameError
+        exit_code = None
+        timed_out = False
+        out = b""
+        err = b""
 
         start = time.time()
         try:
@@ -201,5 +217,11 @@ class CommandTarget:
                 result.coverage = cov
         except Exception:
             pass
+        # 清理临时运行目录（若有）
+        if tmpdir:
+            try:
+                tmpdir.cleanup()
+            except Exception:
+                pass
         return result
 

@@ -11,4 +11,11 @@ __all__ = [
 	"interest_mutator",
 	"havoc_mutator",
 	"splice_mutator",
+	"png_mutator",
+	"jpeg_mutator",
+	"pcap_mutator",
+	"elf_mutator",
+	"lua_mutator",
+	"mjs_mutator",
+	"xml_mutator",
 ]

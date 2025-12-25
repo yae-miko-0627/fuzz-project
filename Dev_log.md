@@ -181,5 +181,29 @@ ovelty（新增覆盖点数）和累计覆盖。
 			--status-interval 5
 		```
 	- 说明：上面命令在容器内运行时会每 5 秒覆盖性打印当前状态行；程序结束后会生成 `monitor_records.json` 与 `coverage_curve.csv`，并在终端打印最终统计信息。 
-	
 
+## 专用变异器扩展（2025-12-25）
+
+2025-12-25：为提高对目标样本格式的语义感知和变异效率，新增一组格式专用变异器（位于 `mini_afl_py/mutators/`）：
+
+- `elf_mutator.py`：只变异 ELF 文件的节区（section）内容，保护 ELF 头与节表不被修改。实现要点：轻量解析 ELF32/ELF64 小端节表，跳过 SHT_NOBITS（.bss），对每个节调用已有基础变异器（`BitflipMutator`/`ArithMutator`/`InterestMutator`/`HavocMutator`），若变体长度与节大小不符则截断或以 0 填充以保持节大小一致。限制：为轻量实现，遇到复杂或非标准 ELF 时会静默跳过。
+
+- `lua_mutator.py`：针对 Lua 源码的文本级变异器。实现要点：保护前 N 行（如 shebang）、内置增强字典（Lua 关键字与常用 API）用于插入/替换、对数字与字符串进行有针对性的变异、变异后尝试修复括号与引号闭合以减少语法错误，并复用基础变异器生成更多变体。限制：采用简单文本策略，复杂语法验证/执行需后续扩展（可接入 Lua 解释器做语法检查）。
+
+- `xml_mutator.py`：针对 XML 的保守变异器。实现要点：保护 `<?xml ... ?>`、`<!DOCTYPE ...>`、注释与 CDATA 区域；检测并跳过常见十六进制校验和字段（32/40/64 长度）；仅对属性值与文本节点应用变异，变异结果在输出前通过 `xml.etree.ElementTree.fromstring()` 做 well-formedness 校验；变异同时对输出进行 XML 转义，保证结构完整。限制：不会主动修复或重写复杂校验和字段。
+
+- `mjs_mutator.py`：针对 ECMAScript 模块（`.mjs`）的变异器。实现要点：保护 shebang 与 `import`/`export` 行以及 `require(...)` 内的路径字符串，内置 JS 关键字/API 词典用于插入/替换，对字符串字面量与数值字面量以及非保护代码块调用基础变异器，变异后执行括号/引号闭合修复并进行简单平衡检查，只有通过简单平衡检查的候选才输出。限制：当前仅做文本级保护与平衡检查，语法级别的精确校验（如 AST 验证）为后续改进项。
+
+- `pcap_mutator.py`：针对 pcap 二进制抓包文件的变异器。实现要点：识别并保护全局头（24 字节）与每个 packet header（16 字节：ts_sec/ts_usec/incl_len/orig_len），仅对每个 packet 的 payload（incl_len 指定）调用基础变异器；变体保持原始 incl_len（通过截断或 0 填充），并提供 per-packet 与全局产出上限。限制：当前实现不重写或修正包内校验和（如 IP/TCP 校验和），且替换逻辑基于 payload 匹配，遇到多个相同 payload 的包时替换可能不按偏移精确定位（后续可改为记录偏移并精确替换）。
+
+- `png_mutator.py`：针对 PNG 图片文件的变异器。实现要点：以 PNG chunk（长度/类型/数据/CRC）为单位解析文件，保护关键头（PNG signature）与非数据元的 chunk 类型（如 IHDR、IEND）；对 `IDAT`、`tEXt` 和 `zTXt` 等数据或文本类 chunk 进行变异，变异后对被修改 chunk 重新计算 CRC 并替换，确保整体文件结构与 chunk 长度字段一致；当需要对 IDAT 内部像素数据做语义变异时，当前策略为直接在压缩数据上做字节级变更（保守策略），并记录为后续改进点（建议：解压/变异/再压缩以保持更合法的图像）。限制：直接修改压缩数据可能导致图像损坏或读取失败，但可触发解析器/解码器漏洞；更高质量变异需实现 IDAT 解压-变异-重压缩流程并正确更新相关长度与 CRC。
+
+- `jpeg_mutator.py`：针对 JPEG/JFIF/Exif 格式图像的变异器。实现要点：解析 JPEG marker 流（以 0xFFD8 SOI 开始，0xFFD9 EOI 结束），识别并保护 SOI、APPn（如 Exif）段与 SOS（Start Of Scan）之前的段元数据；对 SOS 到 EOI 之间的扫描数据（压缩熵编码部分）进行字节级变异以触发解码器在熵解码/去量化/逆变换阶段的潜在问题；变异时保留必要的段长度字段（当变更影响段长度时通过截断或填充保持一致性）并避免破坏 SOI/EOI 标记。限制：直接修改扫描数据常常产生不可解码的输出；更安全的高级策略包括解析 JPEG 到 MCU/系数层级并在系数级别进行变异（后续改进）。
+
+## 重构记录：`fuzzer.py` 重构（2025-12-25）
+
+2025-12-25：对 `mini_afl_py/fuzzer.py` 进行了重构，目标是把原有的占位主循环扩展为一个可运行的最小 fuzz 引擎骨架，变更要点如下：
+
+- **并发状态汇报**：将周期性状态打印抽取到独立的后台线程（`status-reporter`），避免主执行线程在执行外部目标或阻塞操作时无法输出实时状态。
+- **变异器选择逻辑**：按 `--target-format`（或自动检测结果）在循环内以 if/elif 直接选择特化变异器（支持 `elf`, `jpeg`/`jpg`, `lua`, `mjs`, `pcap`, `png`, `xml`）；非特化格式时从基础变异器集合中随机选择（`BitflipMutator`, `ArithMutator`, `InterestMutator`, `HavocMutator`, `SpliceMutator`）。
+- **主循环实现**：实现了从 `Scheduler.next_candidate()` 获取 `Candidate`、对样本应用变异器生成若干变体、调用 `CommandTarget.run()` 执行、将结果传递给 `Monitor.record_run()` 并调用 `Scheduler.report_result()` 的完整流程。对变体数量、每次 mutate() 的迭代数及每个样本的尝试次数均设置上限以避免爆炸性产出。

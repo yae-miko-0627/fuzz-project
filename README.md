@@ -1,6 +1,6 @@
 # MiniAFL 使用教程（手动版，Windows PowerShell）
 
-## 第一步：构建容器
+## 第一步：构建镜像
 借助给出的 Dockerfile 进行构建（请先熟悉 Docker）。
 ```powershell
   docker build -f Dockerfile -t miniafl:latest .
@@ -9,11 +9,17 @@
 ## 第二步：进入容器
 挂载宿主工作区，开启 ptrace 权限。
 ```powershell
-  docker run -it --rm --name miniafl `
+  docker run -d --name fuzz_T01 `
   -v "C:\Users\11053\Desktop\fuzz:/fuzz" `
   -w /fuzz `
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined `
-  miniafl:latest /bin/bash
+  --restart unless-stopped `
+  miniafl:latest tail -f /dev/null
+```
+
+若已存在容器，则直接进入。
+```powershell
+  docker exec -it fuzz_T01 /bin/bash
 ```
 
 ## 第三步：创建独立目录
