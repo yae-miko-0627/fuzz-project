@@ -10,6 +10,18 @@ from typing import Optional
 from pathlib import Path
 import threading
 
+# 兼容性：允许直接用 `python fuzzer.py` 运行而不报相对导入错误。
+# 当脚本作为顶级模块执行（__package__ is None）时，把包的父目录加入 sys.path
+# 并设置 __package__ 为包名，这样后续的相对导入会正常工作。
+if __name__ == "__main__" and __package__ is None:
+	import sys as _sys, os as _os
+	_this_dir = _os.path.dirname(_os.path.abspath(__file__))
+	_pkg_parent = _os.path.dirname(_this_dir)
+	if _pkg_parent not in _sys.path:
+		_sys.path.insert(0, _pkg_parent)
+	__package__ = "mini_afl_py"
+
+
 from .core.scheduler import Scheduler
 from .core.monitor import Monitor
 from .targets.command_target import CommandTarget
@@ -24,7 +36,9 @@ from .mutators.png_mutator import PngMutator
 from .mutators.jpeg_mutator import JpegMutator
 from .mutators.pcap_mutator import PcapMutator
 from .mutators.xml_mutator import XmlMutator
+from .mutators.elf_mutator import ElfMutator
 from .instrumentation.coverage import CoverageData
+from .core.eval import coverage_curve, export_curve_csv
 from .utils import format_detector
 
 
@@ -37,12 +51,11 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 	parser.add_argument("--mode", choices=["stdin", "file"], default="stdin", help="input mode: stdin or file")
 	parser.add_argument("--timeout", type=float, default=1.0, help="per-run timeout in seconds")
 	parser.add_argument("--status-interval", type=int, default=5, help="status print interval in seconds (0 to disable)")
-	parser.add_argument("--target-format", help="explicit target format (lua,mjs,png,jpeg,elf,pcap,xml,other) - optional")
 	return parser.parse_args(argv)
 
 
 def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
-			 runtime_seconds: int, target_format: str, args: argparse.Namespace, out_dir: Path,
+			 runtime_seconds: int, args: argparse.Namespace, out_dir: Path,
 			 basic_mutators=None) -> None:
 	"""核心 fuzz 循环入口。
 
@@ -54,7 +67,7 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 	"""
 	start_ts = time.time()
 	end_ts = start_ts + float(runtime_seconds)
-	print(f"fuzz loop starting: target_format={target_format}, runtime={runtime_seconds}s")
+	print(f"fuzz loop starting, runtime={runtime_seconds}s")
 
 	# 状态打印间隔（秒），若为 0 则不打印
 	status_interval = getattr(args, 'status_interval', 0) or 0
@@ -72,14 +85,8 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 			corpus_size = len(scheduler.corpus)
 			exec_rate = records / elapsed if elapsed > 0 else 0.0
 			remaining_s = int(max(0, end_ts - now))
-			last_summary = "n/a"
-			if records > 0:
-				try:
-					last = monitor.records[-1]
-					last_summary = f"status={last.status}, novelty={last.novelty}, time={last.wall_time:.3f}s"
-				except Exception:
-					last_summary = "n/a"
-			print(f"status: elapsed={int(elapsed)}s, remaining={remaining_s}s, corpus={corpus_size}, records={records}, rate={exec_rate:.2f} r/s, last={last_summary}", flush=True)
+			# 不再打印最近一次记录的详细信息，避免在高频状态打印中访问共享记录列表
+			print(f"status: elapsed={int(elapsed)}s, remaining={remaining_s}s, corpus={corpus_size}, records={records}, rate={exec_rate:.2f} r/s", flush=True)
 			stop_event.wait(status_interval)
 
 	reporter_thread = threading.Thread(target=_reporter, name="status-reporter", daemon=True)
@@ -102,25 +109,23 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 				time.sleep(0.2)
 				continue
 
-			# 根据 target_format 直接选择特化 mutator（if/elif），否则使用基础变异器集合
+			# 根据种子内容检测格式并选择专用变异器（若存在）；否则回退到基础变异器
 			mutator_obj = None
-			fmt = (target_format or '').lower()
-			if fmt == 'elf':
+			seed_fmt = format_detector.detect_from_bytes(cand.data)
+			if seed_fmt == 'elf':
 				mutator_obj = ElfMutator()
-			elif fmt in ('jpeg', 'jpg'):
+			elif seed_fmt in ('jpeg', 'jpg'):
 				mutator_obj = JpegMutator()
-			elif fmt == 'lua':
+			elif seed_fmt == 'lua':
 				mutator_obj = LuaMutator()
-			elif fmt == 'mjs':
+			elif seed_fmt == 'mjs':
 				mutator_obj = MjsMutator()
-			elif fmt == 'pcap':
+			elif seed_fmt == 'pcap':
 				mutator_obj = PcapMutator()
-			elif fmt == 'png':
+			elif seed_fmt == 'png':
 				mutator_obj = PngMutator()
-			elif fmt == 'xml':
+			elif seed_fmt == 'xml':
 				mutator_obj = XmlMutator()
-			else:
-				mutator_obj = None
 
 			import random as _rnd
 			attempts = int(getattr(cand, 'energy', 1) or 1)
@@ -181,6 +186,14 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 	try:
 		outpath = monitor.export_records(str(out_dir / "monitor_records.json"))
 		print(f"monitor records exported to: {outpath}")
+		# 生成覆盖曲线并导出为 CSV（即使记录为空也会写入带表头的文件）
+		try:
+			curve = coverage_curve(monitor)
+			csv_path = str(out_dir / "coverage_curve.csv")
+			export_curve_csv(curve, csv_path)
+			print(f"coverage curve exported to: {csv_path}")
+		except Exception:
+			print("failed to export coverage curve CSV")
 	except Exception:
 		print("failed to export monitor records")
 
@@ -194,11 +207,6 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 	print(f"  total runs: {total_runs}")
 	print(f"  crashes: {crashes}, hangs: {hangs}, novelty_hits: {novelty_hits}")
 	print(f"  cumulative_coverage: {cum_cov} edges")
-	important = [r.artifact_path for r in monitor.records if getattr(r, 'artifact_path', None)]
-	if important:
-		print("  artifacts saved:")
-		for p in important[-10:]:
-			print(f"    - {p}")
 	print("===== fuzz loop finished =====")
 	return
 
@@ -233,18 +241,6 @@ def main(argv: Optional[list] = None) -> int:
 	print(f"seeds: {seeds_path}")
 	print(f"outdir: {out_dir}")
 	print(f"time: {args.time}s, mode: {args.mode}, timeout: {args.timeout}s, status-interval: {args.status_interval}s")
-	
-    # 决定 target_format：优先使用命令行显式参数，其次自动检测
-	if getattr(args, 'target_format', None):
-		target_format = args.target_format.lower()
-	else:
-		# 使用 format_detector 根据 target 文件判断
-		try:
-			target_format = format_detector.detect_from_path(target_path)
-		except Exception:
-			target_format = 'other'
-
-	print(f"detected/selected target_format: {target_format}")
 
 	# 初始化调度器与监控器
 	scheduler = Scheduler()
@@ -271,7 +267,7 @@ def main(argv: Optional[list] = None) -> int:
 
 	# 启动核心 fuzz 循环（当前为占位实现，会在达到时间限制后退出）
 	fuzz_loop(scheduler=scheduler, target=target, monitor=monitor,
-			 runtime_seconds=args.time, target_format=target_format, args=args, out_dir=out_dir)
+			 runtime_seconds=args.time, args=args, out_dir=out_dir)
 
 	return 0
 
