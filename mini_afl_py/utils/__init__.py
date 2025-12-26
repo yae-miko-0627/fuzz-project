@@ -4,4 +4,4 @@ utils 子模块（占位）
 放置通用工具，例如配置管理、日志封装、序列化、持久化等。
 """
 
-__all__ = ["config"]
+__all__ = ["config", "format_detector"]
