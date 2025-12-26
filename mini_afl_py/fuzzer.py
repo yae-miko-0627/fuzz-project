@@ -9,6 +9,7 @@ import time
 from typing import Optional
 from pathlib import Path
 import threading
+import shlex
 
 # 兼容性：允许直接用 `python fuzzer.py` 运行而不报相对导入错误。
 # 当脚本作为顶级模块执行（__package__ is None）时，把包的父目录加入 sys.path
@@ -45,6 +46,7 @@ from .utils import format_detector
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="miniAFL - minimal fuzzer runner")
 	parser.add_argument("--target", required=True, help="path to target binary")
+	parser.add_argument("--target-cmd", help="explicit target command template (e.g. \"readelf -a @@ @@\") - when provided, this string will be split and used as the command; '@@' is replaced with input file path in file mode")
 	parser.add_argument("--seeds", required=True, help="path to seeds directory")
 	parser.add_argument("--outdir", required=True, help="output directory for results")
 	parser.add_argument("--time", type=int, default=3600, help="fuzzing time in seconds")
@@ -85,8 +87,11 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 			corpus_size = len(scheduler.corpus)
 			exec_rate = records / elapsed if elapsed > 0 else 0.0
 			remaining_s = int(max(0, end_ts - now))
-			# 不再打印最近一次记录的详细信息，避免在高频状态打印中访问共享记录列表
-			print(f"status: elapsed={int(elapsed)}s, remaining={remaining_s}s, corpus={corpus_size}, records={records}, rate={exec_rate:.2f} r/s", flush=True)
+			try:
+				cum_cov = len(getattr(monitor, 'cumulative_cov', []))
+			except Exception:
+				cum_cov = 0
+			print(f"status: elapsed={int(elapsed)}s, remaining={remaining_s}s, corpus={corpus_size}, records={records}, rate={exec_rate:.2f} r/s, cum_cov={cum_cov}", flush=True)
 			stop_event.wait(status_interval)
 
 	reporter_thread = threading.Thread(target=_reporter, name="status-reporter", daemon=True)
@@ -261,8 +266,16 @@ def main(argv: Optional[list] = None) -> int:
 	print(f"Scheduler initialized: corpus_size={len(scheduler.corpus)} (added {added} seeds)")
 	print(f"Monitor initialized, artifacts dir: {monitor.out_dir}")
 
-	# 初始化 CommandTarget
-	target_cmd = [str(target_path)]
+	# 初始化 CommandTarget：优先使用 --target-cmd 字符串（会被 shlex.split），否则使用 --target 路径
+	if getattr(args, 'target_cmd', None):
+		try:
+			target_cmd = shlex.split(args.target_cmd)
+		except Exception:
+			# 解析失败时回退为把字符串整体作为命令
+			target_cmd = [args.target_cmd]
+	else:
+		target_cmd = [str(target_path)]
+
 	target = CommandTarget(cmd=target_cmd, timeout_default=args.timeout)
 
 	# 启动核心 fuzz 循环（当前为占位实现，会在达到时间限制后退出）
