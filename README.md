@@ -80,6 +80,48 @@ python3 MiniAFL/mini_afl_py/fuzzer.py \
   --status-interval 5  # 状态刷新间隔（秒，0 关闭）
 ```
 
+### 后台运行示例（把日志写入 output）
+以下示例在容器或宿主上均可运行，演示如何把 fuzzer 放到后台并把运行日志重定向到 `output/fuzzer.log`：
+
+T01（示例）：
+```bash
+# 清空并确保 output 目录存在
+rm -rf /fuzz/T01/output/*; mkdir -p /fuzz/T01/output
+
+# 后台运行 24 小时（86400 秒），状态间隔设为 300 秒（5 分钟）
+nohup python3 -m mini_afl_py.fuzzer \
+  --target '/fuzz/T01/build/cxxfilt' \
+  --seeds /fuzz/T01/seeds \
+  --outdir /fuzz/T01/output \
+  --time 86400 \
+  --mode file \
+  --timeout 5 \
+  --status-interval 300 \
+  > /fuzz/T01/output/fuzzer.log 2>&1 &
+
+# 查看实时日志（可在宿主或容器运行）
+tail -n 200 -f /fuzz/T01/output/fuzzer.log
+```
+
+T02（示例，带 `readelf -a @@ @@` 完整参数）：
+```bash
+rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output
+
+nohup python3 -m mini_afl_py.fuzzer \
+  --target "/fuzz/T02/build/readelf -a @@ @@" \
+  --seeds /fuzz/T02/seeds \
+  --outdir /fuzz/T02/output \
+  --time 86400 \
+  --mode file \
+  --timeout 5 \
+  --status-interval 300 \
+  > /fuzz/T02/output/fuzzer.log 2>&1 &
+
+tail -n 200 -f /fuzz/T02/output/fuzzer.log
+```
+
+注意：上面命令为示例，若在容器外用 `docker exec` 启动，请在命令前加入 `docker exec -d <container> bash -lc "cd /fuzz && ..."` 将命令放到容器内部执行。
+
 ## 第八步：确认结果
 输出位于 `/fuzz/T01/output`，包括记录、覆盖曲线等。
 
