@@ -41,6 +41,8 @@ class HavocMutator:
         - 'set'   : 将某个字节设为随机值
         - 'insert': 在随机位置插入一个随机字节
         - 'delete': 删除随机位置的字节
+        - 'block_xor': 对一个随机长度的连续区块进行异或
+        - 'copy_block': 从自身或语料库复制一段数据并插入到随机位置
         """
         # 根据权重随机选择操作
         actions = list(self.op_weights.keys())
