@@ -17,10 +17,13 @@ class SpliceMutator:
       attempts: 每次 mutate 时尝试拼接的次数。
     """
 
-    def __init__(self, corpus: Sequence[bytes] = None, attempts: int = 8):
+    def __init__(self, corpus: Sequence[bytes] = None, attempts: int = 8, min_out: int = 1, max_out: int = 4096):
         # 将语料保存为列表以便随机选择
         self.corpus = list(corpus) if corpus else []
         self.attempts = attempts
+        # 输出长度限制，避免产生过长或过短样本
+        self.min_out = min_out
+        self.max_out = max_out
 
     def set_corpus(self, corpus: Sequence[bytes]):
         """更新语料池（可在运行时注入外部 corpus）。"""
@@ -35,11 +38,33 @@ class SpliceMutator:
         if not self.corpus:
             return
         for _ in range(self.attempts):
+            # 尝试挑选一个与当前不同的样本，避免无效自拼接
             other = random.choice(self.corpus)
-            if not other:
+            if not other or other == data:
+                # 如果语料中只有相同样本，允许继续但跳过空样本
                 continue
-            # 随机断点（允许断点为 0 或 len，以支持前缀/后缀拼接）
-            a_split = random.randint(0, len(data))
-            b_split = random.randint(0, len(other))
-            out = data[:a_split] + other[b_split:]
+
+            # 多种拼接策略：前缀+后缀、保持前缀、保持后缀、交叉
+            strategy = random.choice(['prefix_suffix', 'keep_prefix', 'keep_suffix', 'crossover'])
+            if strategy == 'prefix_suffix':
+                a_split = random.randint(0, len(data))
+                b_split = random.randint(0, len(other))
+                out = data[:a_split] + other[b_split:]
+            elif strategy == 'keep_prefix':
+                a_split = random.randint(0, len(data))
+                out = data[:a_split] + other
+            elif strategy == 'keep_suffix':
+                b_split = random.randint(0, len(other))
+                out = data + other[b_split:]
+            else:  # crossover
+                # 选择交叉点并拼接中间片段
+                if len(data) == 0 or len(other) == 0:
+                    continue
+                a_split = random.randint(0, len(data)-1)
+                b_split = random.randint(1, len(other))
+                out = data[:a_split] + other[b_split:]
+
+            # 长度约束过滤
+            if len(out) < self.min_out or len(out) > self.max_out:
+                continue
             yield out

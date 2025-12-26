@@ -45,8 +45,7 @@ from .utils import format_detector
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="miniAFL - minimal fuzzer runner")
-	parser.add_argument("--target", required=True, help="path to target binary")
-	parser.add_argument("--target-cmd", help="explicit target command template (e.g. \"readelf -a @@ @@\") - when provided, this string will be split and used as the command; '@@' is replaced with input file path in file mode")
+	parser.add_argument("--target", required=True, help="full target command (e.g. '/path/to/readelf -a @@ @@')")
 	parser.add_argument("--seeds", required=True, help="path to seeds directory")
 	parser.add_argument("--outdir", required=True, help="output directory for results")
 	parser.add_argument("--time", type=int, default=3600, help="fuzzing time in seconds")
@@ -223,14 +222,25 @@ def main(argv: Optional[list] = None) -> int:
 	"""
 	args = parse_args(argv)
 
-	# 基本路径校验
-	target_path = Path(args.target)
+	# 基本路径校验：--target 现在应为完整命令字符串，提取可执行文件并校验其存在
 	seeds_path = Path(args.seeds)
 	out_dir = Path(args.outdir)
 
-	if not target_path.exists():
-		print(f"error: target not found: {target_path}", file=sys.stderr)
+	try:
+		target_tokens = shlex.split(args.target)
+	except Exception:
+		print(f"error: failed to parse --target command: {args.target}", file=sys.stderr)
 		return 2
+
+	if len(target_tokens) == 0:
+		print("error: empty --target", file=sys.stderr)
+		return 2
+
+	target_exec = Path(target_tokens[0])
+	if not target_exec.exists():
+		print(f"error: target executable not found: {target_exec}", file=sys.stderr)
+		return 2
+	# seeds 检查
 	if not seeds_path.exists() or not seeds_path.is_dir():
 		print(f"error: seeds directory not found: {seeds_path}", file=sys.stderr)
 		return 3
@@ -242,7 +252,7 @@ def main(argv: Optional[list] = None) -> int:
 		return 4
 
 	# 把解析结果打印以便调试（后续可切换到日志）
-	print(f"target: {target_path}")
+	print(f"target: {args.target}")
 	print(f"seeds: {seeds_path}")
 	print(f"outdir: {out_dir}")
 	print(f"time: {args.time}s, mode: {args.mode}, timeout: {args.timeout}s, status-interval: {args.status_interval}s")
@@ -266,16 +276,8 @@ def main(argv: Optional[list] = None) -> int:
 	print(f"Scheduler initialized: corpus_size={len(scheduler.corpus)} (added {added} seeds)")
 	print(f"Monitor initialized, artifacts dir: {monitor.out_dir}")
 
-	# 初始化 CommandTarget：优先使用 --target-cmd 字符串（会被 shlex.split），否则使用 --target 路径
-	if getattr(args, 'target_cmd', None):
-		try:
-			target_cmd = shlex.split(args.target_cmd)
-		except Exception:
-			# 解析失败时回退为把字符串整体作为命令
-			target_cmd = [args.target_cmd]
-	else:
-		target_cmd = [str(target_path)]
-
+	# 初始化 CommandTarget：--target 为完整命令字符串（例如 '/full/path/readelf -a @@ @@'）
+	target_cmd = target_tokens
 	target = CommandTarget(cmd=target_cmd, timeout_default=args.timeout)
 
 	# 启动核心 fuzz 循环（当前为占位实现，会在达到时间限制后退出）

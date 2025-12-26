@@ -17,9 +17,20 @@ class HavocMutator:
       max_changes: 每轮中随机修改的最大次数（实际次数在 1..max_changes 之间）。
     """
 
-    def __init__(self, rounds: int = 20, max_changes: int = 8):
+    def __init__(self, rounds: int = 20, max_changes: int = 8, corpus: list = None):
         self.rounds = rounds
         self.max_changes = max_changes
+        # 可选语料库，用于执行 copy / splice 风格的变异
+        self.corpus = list(corpus) if corpus else []
+        self.op_weights = {
+            'flip': 20,
+            'xor': 20,
+            'set': 15,
+            'insert': 15,
+            'delete': 10,
+            'block_xor': 10,
+            'copy_block': 10,
+        }
 
     def _random_edit(self, data: bytearray):
         """在字节数组上执行单次随机编辑。
@@ -31,7 +42,10 @@ class HavocMutator:
         - 'insert': 在随机位置插入一个随机字节
         - 'delete': 删除随机位置的字节
         """
-        action = random.choice(['flip', 'xor', 'insert', 'delete', 'set'])
+        # 根据权重随机选择操作
+        actions = list(self.op_weights.keys())
+        weights = [self.op_weights[a] for a in actions]
+        action = random.choices(actions, weights=weights, k=1)[0]
         if action == 'flip':
             if not data:
                 return
@@ -57,6 +71,30 @@ class HavocMutator:
                 return
             idx = random.randrange(len(data))
             del data[idx]
+        elif action == 'block_xor':
+            # 对一个随机长度的连续区块进行异或
+            if not data:
+                return
+            start = random.randrange(len(data))
+            max_len = min(16, len(data) - start)
+            length = random.randint(1, max_len)
+            key = random.randrange(1, 256)
+            for i in range(start, start + length):
+                data[i] ^= key
+        elif action == 'copy_block':
+            # 从自身或语料库复制一段数据并插入到随机位置
+            if self.corpus and random.random() < 0.5:
+                other = random.choice(self.corpus)
+            else:
+                other = bytes(data)
+            if not other:
+                return
+            start = random.randrange(len(other))
+            length = random.randint(1, min(16, len(other)-start))
+            block = other[start:start+length]
+            idx = random.randrange(len(data)+1) if data else 0
+            for b in reversed(block):
+                data.insert(idx, b)
 
     def mutate(self, data: bytes) -> Iterable[bytes]:
         """对输入执行多轮随机编辑，每轮产出一个变体。"""

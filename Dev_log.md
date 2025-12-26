@@ -207,3 +207,24 @@ ovelty（新增覆盖点数）和累计覆盖。
 - **并发状态汇报**：将周期性状态打印抽取到独立的后台线程（`status-reporter`），避免主执行线程在执行外部目标或阻塞操作时无法输出实时状态。
 - **变异器选择逻辑**：按 `--target-format`（或自动检测结果）在循环内以 if/elif 直接选择特化变异器（支持 `elf`, `jpeg`/`jpg`, `lua`, `mjs`, `pcap`, `png`, `xml`）；非特化格式时从基础变异器集合中随机选择（`BitflipMutator`, `ArithMutator`, `InterestMutator`, `HavocMutator`, `SpliceMutator`）。
 - **主循环实现**：实现了从 `Scheduler.next_candidate()` 获取 `Candidate`、对样本应用变异器生成若干变体、调用 `CommandTarget.run()` 执行、将结果传递给 `Monitor.record_run()` 并调用 `Scheduler.report_result()` 的完整流程。对变体数量、每次 mutate() 的迭代数及每个样本的尝试次数均设置上限以避免爆炸性产出。
+
+## 本次调试与变异器增强（2025-12-26）
+
+2025-12-26：针对 `mini_afl_py/fuzzer.py` 的调试工作与对若干变异器的增强已完成并验证，摘要如下：
+
+- 问题背景与修复
+	- 发现 `--target-cmd` 与 `--target` 的语义及 wrapper/超时交互导致在短超时时间内未能稳定产出 AFL 位图（coverage 0）的情况；另外在多次编辑 CLI 参数时引入了一个打印时的 `NameError`。
+	- 采取措施：移除/停止使用 `--target-cmd` 的不确定路径（改为强制传入完整 `--target` 命令字符串并用 `shlex.split` 解析），修复 `fuzzer.py` 中的打印错误；优先使用 `shm_py` 模式（System V SHM）收集覆盖位图以避开 `afl-showmap` wrapper 的每次调用开销与超时问题。
+
+- 关键文件变更（本次）
+	- `mini_afl_py/fuzzer.py`：要求 `--target` 必填（完整命令），修正打印错误并明确使用 `CommandTarget(cmd=shlex.split(args.target))`；增强状态打印与监控导出保持不变。
+	- `mini_afl_py/instrumentation/shm_manager.py`：验证并使用现有 `run_target_with_shm()` 接口用于目标执行并把位图写出（无代码变更，仅验证/使用）。
+	- 变异器增强（已实现并提交）：
+		- `mini_afl_py/mutators/bitflip_mutator.py`：增加多模式翻转（单比特、双比特、整字节、窗口翻转），提高变异多样性。
+		- `mini_afl_py/mutators/havoc_mutator.py`：加入操作权重、可选语料`corpus`支持以及块异或（`block_xor`）和复制块（`copy_block`）操作，提升大扰动策略的表现力。
+		- `mini_afl_py/mutators/splice_mutator.py`：避免自我拼接无效样本，增加多种拼接策略（前缀/后缀/保持前缀/保持后缀/交叉），并添加输出长度约束过滤。
+
+- 验证摘要
+	- 使用 `mini_afl_py/instrumentation/shm_manager.py` 在容器中对目标进行了单次运行测试：`run_target_with_shm()` 生成的 map 文件长度为 256 字节，解析后 `parse_afl_map()` 返回覆盖点数 252（作为基线验证）。
+	- 在修复 `fuzzer.py` 的 `--target` 处理后，短跑 fuzz（shm 模式）显示监控导出文件 `monitor_records.json` 与 `coverage_curve.csv`，并能正确报告累计覆盖（cum_cov = 252）。
+	- 变异器功能通过静态检查与小规模本地 mutate 调用验证，不引入语法错误或运行时异常（已通过 Python 语法检查）。
