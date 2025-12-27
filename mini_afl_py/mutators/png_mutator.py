@@ -91,7 +91,6 @@ class PngMutator:
         if not choices:
             return out
         start, end, _ = self.rng.choice(choices)
-        # payload area: start+8 .. end-4
         payload_start = start + 8
         payload_end = end - 4
         if payload_end <= payload_start:
@@ -106,7 +105,6 @@ class PngMutator:
         if not choices:
             return out
         start, end, _ = self.rng.choice(choices)
-        # length field at start..start+4 big endian
         new_len = self.rng.randrange(0, max(1, end - start + 100))
         struct.pack_into('>I', out, start, new_len)
         return out
@@ -133,7 +131,6 @@ class PngMutator:
         payload_start = ihdr[0] + 8
         if payload_start + 8 > len(out):
             return out
-        # width and height big-endian 4 bytes each
         width = struct.unpack_from('>I', out, payload_start)[0]
         height = struct.unpack_from('>I', out, payload_start+4)[0]
         new_w = max(1, (width + self.rng.randint(-100,100)) & 0xFFFFFFFF)

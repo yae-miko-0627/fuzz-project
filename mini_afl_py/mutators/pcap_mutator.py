@@ -53,8 +53,6 @@ class PcapMutator:
             # 不能识别的魔法数，尝试小端
             endian = '<'
 
-        # global header fields but we only need to know header size
-        # parse packet records
         off = 24
         n = len(data)
         packets = []
@@ -63,7 +61,6 @@ class PcapMutator:
             data_start = off + 16
             data_end = data_start + incl_len
             if data_end > n:
-                # malformed, truncate parsing
                 break
             packets.append((off, off+4, off+8, data_start))
             off = data_end
@@ -91,7 +88,6 @@ class PcapMutator:
             return out
         pkt = self.rng.choice(packets)
         data_start = pkt[3]
-        # get incl_len from header
         incl_len = struct.unpack_from(gh['endian'] + 'I', out, pkt[2])[0]
         if incl_len == 0:
             return out
@@ -105,7 +101,6 @@ class PcapMutator:
             return out
         pkt = self.rng.choice(packets)
         start = pkt[0]
-        # compute incl_len
         incl_len = struct.unpack_from(gh['endian'] + 'I', out, pkt[2])[0]
         data_start = pkt[3]
         data_end = data_start + incl_len
@@ -134,7 +129,6 @@ class PcapMutator:
             return out
         pkt = self.rng.choice(packets)
         off_incl = pkt[2]
-        # set a new incl_len possibly larger or smaller
         new_len = max(0, self.rng.randrange(0, 65535))
         struct.pack_into(gh['endian'] + 'I', out, off_incl, new_len)
         return out

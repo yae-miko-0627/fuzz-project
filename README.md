@@ -1,3 +1,55 @@
+MiniAFL是根据AFL++进行的简化，主要功能是针对被测文件进行模糊测试
+
+# MiniAFL 项目说明
+总体上，MiniAFL可以通过fuzzer.py完成fuzz循环，关键的工具实现在其他相关目录中。MiniAFL需要借助AFL++的插桩，接收插桩好的二进制文件进行测试，下面将对各个工具进行以及主程序进行说明。
+
+## 项目结构
+core/:调度器Scheduuler,监控Monitor，评估汇总eval
+mutators/:各类变异器以及针对专用格式变异器
+targets/:目标运行封装(CommandTarget)，负责把变体送入被测程序并收集运行结果
+instrumentions/:Coverage覆盖收集，Shm_Manager共享内存管理
+utils/:辅助工具，Config参数默认设置，Format_detector种子形式分析
+
+## 关键组件说明
+Scheduler(调度器)：
+角色：管理语料库（corpus）、候选（Candidate）选择与接收执行结果的反馈（report_result）。
+行为：从 seeds 初始化语料，基于调度策略（能量值/启发式）选择下一个候选用于变异
+
+Monitor（监控器）:
+角色：记录每次执行的结果（状态、壁钟时间、覆盖、产生的 artifact），并能导出 monitor_records.json 与覆盖曲线 CSV。
+用途：用于后处理、统计与绘制覆盖增长曲线（coverage_curve / export_curve_csv）
+
+CommandTarget（目标运行器）:
+角色：把变体写入 stdin 或临时文件并以子进程（或命令模板）运行目标，收集退出状态、超时、覆盖信息与可能的崩溃产物路径。
+特点：--target 以完整命令字符串传入（shlex.split 解析）
+
+变异器集合（mutators）:
+基础变异器：Bitflip, Arith, Interest, Havoc, Splice —— 用于通用变异策略。
+专用变异器：面向格式的变异器（PNG/JPEG/ELF/PCAP/Lua/MJS/XML 等），在检测到种子格式时优先使用
+
+## fuzzer.py工作流程
+入口与参数:
+入口位于 fuzzer.py:1。通过 parse_args 解析 --target, --seeds, --outdir, --time, --mode, --timeout, --status-interval 等参数（见代码行 17–35）。
+--target 要求传入完整命令字符串（如 "/full/path/readelf -a @@ @@"），脚本使用 shlex.split 解析并验证可执行文件存在（见 代码段 fuzzer.py:104）。
+
+初始化:
+创建 Scheduler() 与 Monitor(out_dir=...)（见 fuzzer.py:126）。
+从 --seeds 目录读取种子文件，调用 scheduler.add_seed(data) 将初始语料加载到调度器（见 fuzzer.py:134）。
+初始化 CommandTarget(cmd=target_tokens, timeout_default=...) 作为运行器。
+
+核心 fuzz 循环（fuzz_loop）:
+启动状态 reporter 线程以周期性打印进度（elapsed、corpus、exec_rate、累计覆盖）（见 fuzzer.py:19）。
+主循环步骤（见 fuzzer.py:31-40）：
+调用 scheduler.next_candidate() 获取待变异的候选（若无则短睡等待）。
+使用 format_detector.detect_from_bytes(cand.data) 判断格式，优先选用相应的专用变异器（比如 ELF -> ElfMutator）；若无专用变异器，从基础变异器集合随机选择（见 fuzzer.py:62）。
+根据候选的 energy 字段决定尝试次数（最多 8 次），对每次尝试生成若干变体（每次最多处理 4 个变体），对每个变体调用 target.run(variant, mode, timeout) 运行目标。
+将运行结果通过 monitor.record_run(...) 记录，并调用 scheduler.report_result(variant, res) 将结果反馈给调度器（用于更新语料/种子优先级或收录有趣样本）。
+周期性检查时间上限，超时则退出循环（并在 finally 中导出监控记录和覆盖曲线 CSV）。
+
+结束与导出:
+fuzzer 在结束时调用 monitor.export_records() 导出 monitor_records.json，并用 coverage_curve / export_curve_csv 导出 coverage_curve.csv（见 fuzzer.py:179）。
+打印汇总：总运行次数、崩溃数、hangs、novelty hits、累计覆盖等（见末尾汇总打印）。
+
 # MiniAFL 使用教程（手动版，Windows PowerShell）
 
 ## 第一步：构建镜像
@@ -128,3 +180,19 @@ tail -n 200 -f /fuzz/T02/output/fuzzer.log
 提示：
 - `--target` 替换为实际产物路径（如 `/fuzz/T01/build/cxxfilt`）。
 - 长时间运行建议在 tmux/screen 中执行，避免会话中断。
+
+# 项目工作说明
+
+## 项目成员
+郑智文  241880567
+张苏楠  241880199
+马宇航  241880054
+
+## 工作说明
+初期由马宇航实现了项目框架的构建以及最小循环的初步实现，并初步完成了core以及通用mutator的实现
+
+中期由张苏楠和郑智文共同完成，主要完善了coverage和shm_manager，确保了该项目可以正常使用afl++编译的二进制文件，同时完成了对T01的初步测试
+
+后期由郑智文完成，在对T02进行测试的过程中，追加了各个针对种子类型的特殊变异器，并优化了fuzzer.py的实现
+
+测试由三人共同完成
