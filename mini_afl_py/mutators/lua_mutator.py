@@ -1,211 +1,190 @@
-"""
-Lua 特殊变异器
+"""轻量级 Lua 变异器（用于模糊测试）。
 
-功能要点：
-- 识别 Lua 文本（尽量以 utf-8 解码），保护 shebang（若存在）和文件开头若干字节（可配置）；
-- 内置增强字典（Lua 关键字、常用标准库函数与常见字面量），用于插入/替换；
-- 在变异后尝试修复基本语法闭合：括号/中括号/大括号与成对引号（单/双引号）；
-- 在内部复用已有基础变异器（Havoc/Interest/Arith）对字符串片段或整个文件做变异；
-- 对变体数量与每种策略产出进行上限控制以防爆炸。
+实现若干文本/语义对齐的轻量变异策略：
+- 标识符改名（小幅扰动）
+- 数字微调（加/减小整数/浮点）
+- 字符串内容破坏或插入随机字节
+- 删除或注释整行/语句
+- 在行间插入简单字面量（nil/true/false/0）
+- 交换相邻行
 
-实现说明：此 mutator 采用文本为主的策略，尽量保持源码结构完整。对于不合法或二进制数据将尽早退回不产生变体。
+仅使用标准库，实现简单且高效，适合嵌入到高速变异循环中。
 """
 from __future__ import annotations
 
-import re
 import random
-from typing import Iterable, List, Optional
-
-from .havoc_mutator import HavocMutator
-from .interest_mutator import InterestMutator
-from .arith_mutator import ArithMutator
-
-
-DEFAULT_DICT = [
-    # Lua 关键字
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
-    "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then",
-    "true", "until", "while",
-    # 常用标准库函数 / 常见模式
-    "print", "pairs", "ipairs", "next", "tonumber", "tostring", "string.sub", "string.match",
-    "string.gsub", "table.insert", "table.remove", "math.floor", "math.ceil", "math.random",
-    "io.open", "os.execute"  # 默认避免 I/O，保持注释状态
-]
-
-
-def _decode_text(data: bytes) -> Optional[str]:
-    try:
-        return data.decode("utf-8")
-    except Exception:
-        try:
-            return data.decode("latin-1")
-        except Exception:
-            return None
-
-
-def _encode_text(s: str, orig_bytes: bytes) -> bytes:
-    # 尝试保留原始编码（utf-8 优先），回退到 latin-1
-    try:
-        return s.encode("utf-8")
-    except Exception:
-        try:
-            return s.encode("latin-1")
-        except Exception:
-            return s.encode("utf-8", errors="ignore")
-
-
-def _fix_brackets_and_quotes(s: str) -> str:
-    # 修复括号、方括号、大括号
-    pairs = [("(", ")"), ("[", "]"), ("{", "}")]
-    for o, c in pairs:
-        opens = s.count(o)
-        closes = s.count(c)
-        if opens > closes:
-            s = s + (c * (opens - closes))
-    # 修复引号（非转义的单/双引号计数）
-    def count_unescaped(q):
-        cnt = 0
-        i = 0
-        while True:
-            i = s.find(q, i)
-            if i == -1:
-                break
-            # 检查前导反斜杠数量
-            back = 0
-            j = i - 1
-            while j >= 0 and s[j] == "\\":
-                back += 1
-                j -= 1
-            if back % 2 == 0:
-                cnt += 1
-            i += 1
-        return cnt
-
-    for q in ["'", '"']:
-        if count_unescaped(q) % 2 == 1:
-            s = s + q
-    return s
+import re
+from typing import Optional
 
 
 class LuaMutator:
-    """Lua 源代码变异器。
+    """轻量 Lua 变异器。"""
 
-    策略：
-    - 优先在字符串、数字等 token 上应用基于 interest/arith 的替换；
-    - 在标识符位置随机插入或替换字典 token；
-    - 使用 HavocMutator 做少量随机编辑以增加多样性；
-    - 每次变异后执行简单的语法闭合修复。
-    """
+    IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+    NUMBER_RE = re.compile(r"\b(\d+\.?\d*|\d*\.\d+)\b")
+    STRING_RE = re.compile(r"('(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\")")
 
-    def __init__(self, mutators: Optional[List] = None, dict_tokens: Optional[List[str]] = None,
-                 protect_prefix_lines: int = 1, max_variants: int = 200):
-        # 使用简单的基础变异器集合（可被外部覆盖）
-        if mutators is None:
-            mutators = [HavocMutator(rounds=4, max_changes=4), InterestMutator(max_positions=32), ArithMutator(max_positions=16)]
-        self.mutators = mutators
-        self.dict_tokens = dict_tokens or DEFAULT_DICT
-        self.protect_prefix_lines = int(protect_prefix_lines)
-        self.max_variants = int(max_variants)
+    def __init__(self, seed: Optional[int] = None) -> None:
+        self.rng = random.Random(seed)
 
-    def _split_protect_prefix(self, text: str):
-        # 保护前 N 行（例如 shebang），避免破坏解释器行或文件注释头
-        if self.protect_prefix_lines <= 0:
-            return "", text
-        parts = text.splitlines(keepends=True)
-        prefix = ''.join(parts[:self.protect_prefix_lines])
-        rest = ''.join(parts[self.protect_prefix_lines:])
-        return prefix, rest
+    def mutate(self, data: bytes, num_mutations: int = 1) -> bytes:
+        """对 Lua 文本执行若干次变异并返回结果（utf-8 编码）。
 
-    def _insert_dict_token(self, text: str) -> str:
-        # 在随机标识符边界插入一个字典 token
-        # 找到所有单词边界位置
-        words = list(re.finditer(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", text))
-        if not words:
-            # 如果找不到位置，直接在末尾附加
-            pos = len(text)
-        else:
-            m = random.choice(words)
-            pos = m.end()
-        tok = random.choice(self.dict_tokens)
-        return text[:pos] + " " + tok + text[pos:]
+        若输入无法解码为文本，则回退到字节级简单变异。
+        """
+        try:
+            src = data.decode('utf-8')
+        except Exception:
+            return self._fallback_byte_mutation(data)
 
-    def _replace_number_literals(self, text: str) -> str:
-        # 将部分数字字面量替换为常用数值
-        nums = ["0", "1", "-1", "2", "-2", "0xFF", "1e3"]
-        def repl(m):
-            if random.random() < 0.5:
-                return random.choice(nums)
-            return m.group(0)
-        return re.sub(r"\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b", repl, text, flags=re.IGNORECASE)
+        lines = src.splitlines(True)
 
-    def mutate(self, data: bytes) -> Iterable[bytes]:
-        text = _decode_text(data)
-        if text is None:
-            return
-
-        prefix, body = self._split_protect_prefix(text)
-
-        variants = 0
-
-        # 策略 1：插入字典 token
-        if variants < self.max_variants:
+        for _ in range(num_mutations):
+            ops = [self._rename_identifier, self._tweak_number, self._corrupt_string,
+                   self._delete_or_comment_line, self._insert_literal, self._swap_adjacent_lines]
+            op = self.rng.choice(ops)
             try:
-                new_body = self._insert_dict_token(body)
-                new_body = _fix_brackets_and_quotes(new_body)
-                yield _encode_text(prefix + new_body, data)
-                variants += 1
-            except Exception:
-                pass
-
-        # 策略 2：替换数字字面量
-        if variants < self.max_variants:
-            try:
-                new_body = self._replace_number_literals(body)
-                new_body = _fix_brackets_and_quotes(new_body)
-                yield _encode_text(prefix + new_body, data)
-                variants += 1
-            except Exception:
-                pass
-
-        # 策略 3：对字符串/部分文本应用基础变异器（使用 Havoc/Interest/Arith）
-        for mut in self.mutators:
-            if variants >= self.max_variants:
-                break
-            try:
-                # 应用到 body（文本）上的变异，mutator 接受 bytes
-                for v in mut.mutate(body.encode("utf-8", errors="ignore") if isinstance(body, str) else body):
-                    if variants >= self.max_variants:
-                        break
-                    # v 可能是 bytes，解码后修复
-                    try:
-                        vb = v.decode("utf-8")
-                    except Exception:
-                        vb = v.decode("latin-1", errors="ignore")
-                    vb = _fix_brackets_and_quotes(vb)
-                    yield _encode_text(prefix + vb, data)
-                    variants += 1
+                src = op(src, lines)
+                lines = src.splitlines(True)
             except Exception:
                 continue
 
-        # 策略 4：少量全文件 Havoc（仍保护前缀）
-        if variants < self.max_variants:
-            try:
-                # 用 HavocMutator 生成一些随机变体
-                h = HavocMutator(rounds=4, max_changes=6)
-                for v in h.mutate(body.encode("utf-8", errors="ignore")):
-                    if variants >= self.max_variants:
-                        break
-                    try:
-                        vb = v.decode("utf-8")
-                    except Exception:
-                        vb = v.decode("latin-1", errors="ignore")
-                    vb = _fix_brackets_and_quotes(vb)
-                    yield _encode_text(prefix + vb, data)
-                    variants += 1
-            except Exception:
-                pass
+        return src.encode('utf-8', errors='ignore')
 
-        return
+    def _fallback_byte_mutation(self, data: bytes) -> bytes:
+        b = bytearray(data)
+        if not b:
+            return data
+        i = self.rng.randrange(len(b))
+        b[i] = (b[i] + self.rng.randrange(1, 255)) & 0xFF
+        return bytes(b)
+
+    def _rename_identifier(self, src: str, lines) -> str:
+        # 在所有标识符中随机选择一个并做小幅修改（加后缀/替换字符）
+        idents = list(self.IDENT_RE.finditer(src))
+        if not idents:
+            return src
+        m = self.rng.choice(idents)
+        name = m.group(1)
+        # 保留 Lua 关键字表简单过滤（非穷尽）
+        lua_keywords = {
+            'and','break','do','else','elseif','end','false','for','function',
+            'if','in','local','nil','not','or','repeat','return','then','true','until','while'
+        }
+        if name in lua_keywords:
+            return src
+        new = self._mutate_identifier(name)
+        start, end = m.span(1)
+        return src[:start] + new + src[end:]
+
+    def _mutate_identifier(self, s: str) -> str:
+        r = self.rng.random()
+        if r < 0.4 and len(s) > 1:
+            i = self.rng.randrange(len(s))
+            c = self.rng.choice('abcdefghijklmnopqrstuvwxyz0123456789_')
+            return s[:i] + c + s[i+1:]
+        elif r < 0.8:
+            return s + self.rng.choice(['_x', '_tmp', str(self.rng.randrange(10,99))])
+        else:
+            return s[::-1]
+
+    def _tweak_number(self, src: str, lines) -> str:
+        nums = list(self.NUMBER_RE.finditer(src))
+        if not nums:
+            return src
+        m = self.rng.choice(nums)
+        val = m.group(1)
+        try:
+            if '.' in val:
+                f = float(val)
+                delta = self.rng.uniform(-5.0, 5.0)
+                new = str(f + delta)
+            else:
+                i = int(val)
+                delta = self.rng.randint(-10, 10)
+                new = str(max(0, i + delta))
+        except Exception:
+            new = val
+        start, end = m.span(1)
+        return src[:start] + new + src[end:]
+
+    def _corrupt_string(self, src: str, lines) -> str:
+        strs = list(self.STRING_RE.finditer(src))
+        if not strs:
+            return src
+        m = self.rng.choice(strs)
+        s = m.group(1)
+        quote = s[0]
+        inner = s[1:-1]
+        # 对字符串内容进行小幅破坏或插入
+        r = self.rng.random()
+        if r < 0.4 and inner:
+            i = self.rng.randrange(len(inner))
+            c = self.rng.choice('abcdefghijklmnopqrstuvwxyz0123456789')
+            new_inner = inner[:i] + c + inner[i+1:]
+        elif r < 0.8:
+            new_inner = inner + self._random_text(3)
+        else:
+            new_inner = ''
+        new = quote + new_inner + quote
+        start, end = m.span(1)
+        return src[:start] + new + src[end:]
+
+    def _delete_or_comment_line(self, src: str, lines) -> str:
+        # 随机删除一行或将其注释掉
+        if not lines:
+            return src
+        idx = self.rng.randrange(len(lines))
+        line = lines[idx]
+        if self.rng.random() < 0.5:
+            # 删除
+            return ''.join(lines[:idx] + lines[idx+1:])
+        else:
+            # 注释（若已注释则解除注释）
+            stripped = line.lstrip()
+            prefix_len = len(line) - len(stripped)
+            if stripped.startswith('--'):
+                # 解除注释
+                new_line = ' ' * prefix_len + stripped[2:]
+            else:
+                new_line = ' ' * prefix_len + '--' + stripped
+            new_lines = lines[:idx] + [new_line] + lines[idx+1:]
+            return ''.join(new_lines)
+
+    def _insert_literal(self, src: str, lines) -> str:
+        # 在随机位置插入简单字面量以破坏控制流
+        litterals = ['nil', 'true', 'false', '0']
+        pos = self.rng.randrange(len(src)+1)
+        lit = self.rng.choice(litterals)
+        # 在非字母位置插入以减少语法粘连
+        return src[:pos] + ' ' + lit + ' ' + src[pos:]
+
+    def _swap_adjacent_lines(self, src: str, lines) -> str:
+        if len(lines) < 2:
+            return src
+        idx = self.rng.randrange(len(lines)-1)
+        new_lines = lines[:]
+        new_lines[idx], new_lines[idx+1] = new_lines[idx+1], new_lines[idx]
+        return ''.join(new_lines)
+
+    def _random_text(self, max_len: int = 6) -> str:
+        l = self.rng.randrange(1, max_len+1)
+        return ''.join(self.rng.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(l))
 
 
-__all__ = ["LuaMutator"]
+if __name__ == '__main__':
+        sample = """-- 示例 Lua 脚本
+local x = 42
+local s = "hello"
+for i=1,5 do
+    x = x + i
+    print(s, x)
+end
+"""
+        m = LuaMutator(seed=2025)
+        print('原始:')
+        print(sample)
+        for i in range(6):
+                out = m.mutate(sample.encode('utf-8'), num_mutations=2)
+                print(f'变异 {i+1}:')
+                print(out.decode('utf-8'))
