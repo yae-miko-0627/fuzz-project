@@ -1,300 +1,198 @@
-"""
-MJS (ECMAScript module .mjs) 专用变异器
+"""轻量级 MJS（ES module）变异器。
 
-特点：
-- 识别并保护 shebang（#!）以及 `import` / `export` 语句行和 `require(...)` 调用处的字符串路径，避免破坏模块边界；
-- 内置增强字典（JS 关键字与常用 API）用于插入/替换标识符；
-- 使用已有基础变异器（Havoc/Interest/Arith）对字符串字面量、数字字面量与非保护文本块进行变异；
-- 变异后进行括号/中括号/大括号与引号闭合修复，仅在基本平衡检查通过时输出变体；
-- 对产出数量设置上限以防止爆炸。
+提供小巧且高效的 JS/MJS 特定变异策略，适合嵌入模糊测试循环：
+- 标识符改名（小幅扰动）
+- 数字微调
+- 字符串内容破坏/插入
+- 操作符替换（==/===, !=/!== 等）
+- 注释切换/删除行
+- 插入简单字面量（undefined/null/0）
+- 交换相邻语句/行
 
-说明：本实现采用轻量文本级策略；若需更严格的语法验证，可后续集成基于 Node 的解析器（`acorn` / `esprima`）。
+仅使用 Python 标准库实现，带可复现的随机种子和示例。
 """
 from __future__ import annotations
 
-import re
 import random
-from typing import Iterable, List, Optional, Tuple
-
-from .havoc_mutator import HavocMutator
-from .interest_mutator import InterestMutator
-from .arith_mutator import ArithMutator
-
-
-DEFAULT_DICT = [
-    # JS 关键字
-    "var", "let", "const", "function", "return", "if", "else", "for", "while", "switch", "case",
-    "break", "continue", "class", "extends", "import", "export", "from", "default", "new", "try", "catch",
-    "finally", "throw", "async", "await", "yield", "typeof", "instanceof", "in", "of",
-    # 常用 API
-    "console", "log", "JSON", "parse", "stringify", "Math", "Date", "setTimeout", "setInterval",
-    "Promise", "fetch", "require", "module", "exports"
-]
-
-
-def _decode_text(data: bytes) -> Optional[str]:
-    try:
-        return data.decode('utf-8')
-    except Exception:
-        try:
-            return data.decode('latin-1')
-        except Exception:
-            return None
-
-
-def _encode_text(s: str, orig_bytes: bytes) -> bytes:
-    try:
-        return s.encode('utf-8')
-    except Exception:
-        try:
-            return s.encode('latin-1')
-        except Exception:
-            return s.encode('utf-8', errors='ignore')
-
-
-def _count_unescaped(text: str, ch: str) -> int:
-    cnt = 0
-    i = 0
-    while True:
-        i = text.find(ch, i)
-        if i == -1:
-            break
-        # 统计前置反斜杠数量
-        back = 0
-        j = i - 1
-        while j >= 0 and text[j] == '\\':
-            back += 1
-            j -= 1
-        if back % 2 == 0:
-            cnt += 1
-        i += 1
-    return cnt
-
-
-def _fix_brackets_and_quotes(s: str) -> str:
-    pairs = [('(', ')'), ('[', ']'), ('{', '}')]
-    for o, c in pairs:
-        opens = s.count(o)
-        closes = s.count(c)
-        if opens > closes:
-            s = s + (c * (opens - closes))
-    # 引号
-    for q in ['"', "'", '`']:
-        if _count_unescaped(s, q) % 2 == 1:
-            s = s + q
-    return s
-
-
-def _find_protected_spans(text: str) -> List[Tuple[int, int]]:
-    """保护 shebang 与 import/export/require 语句行（行级保护）。"""
-    spans: List[Tuple[int, int]] = []
-    # shebang 行
-    if text.startswith('#!'):
-        nl = text.find('\n')
-        if nl == -1:
-            spans.append((0, len(text)))
-        else:
-            spans.append((0, nl+1))
-    # import/export 行（按行简单处理）
-    for m in re.finditer(r'^(\s*(?:import|export)\b.*)$', text, flags=re.MULTILINE):
-        spans.append((m.start(1), m.end(1)))
-    # require('...') 字符串：保护 require 内的字符串字面量
-    for m in re.finditer(r"require\(\s*(['\"])(.*?)\1\s*\)", text):
-        # 保护 require(...) 内被引号包裹的路径
-        q = m.group(1)
-        inner_start = m.start(2)
-        inner_end = m.end(2)
-        spans.append((inner_start, inner_end))
-    # 合并
-    spans.sort()
-    merged: List[Tuple[int, int]] = []
-    for s, e in spans:
-        if not merged or s > merged[-1][1]:
-            merged.append((s, e))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-    return merged
-
-
-def _is_in_spans(pos: int, spans: List[Tuple[int, int]]) -> bool:
-    for s, e in spans:
-        if s <= pos < e:
-            return True
-    return False
+import re
+from typing import Optional
 
 
 class MjsMutator:
-    def __init__(self, mutators: Optional[List] = None, dict_tokens: Optional[List[str]] = None,
-                 per_span_limit: int = 50, max_variants: int = 200):
-        if mutators is None:
-            mutators = [HavocMutator(rounds=4, max_changes=4), InterestMutator(max_positions=64), ArithMutator(max_positions=32)]
-        self.mutators = mutators
-        self.dict_tokens = dict_tokens or DEFAULT_DICT
-        self.per_span_limit = int(per_span_limit)
-        self.max_variants = int(max_variants)
+    """轻量 MJS 变异器实现。"""
 
-    def _insert_dict_token(self, text: str) -> str:
-        words = list(re.finditer(r"\b[a-zA-Z_$][a-zA-Z0-9_$]*\b", text))
-        if not words:
-            pos = len(text)
-        else:
-            m = random.choice(words)
-            pos = m.end()
-        tok = random.choice(self.dict_tokens)
-        return text[:pos] + " " + tok + text[pos:]
+    IDENT_RE = re.compile(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\b")
+    NUMBER_RE = re.compile(r"\b(\d+\.?\d*|\d*\.\d+)\b")
+    STRING_RE = re.compile(r"(`(?:\\`|[^`])*`|'(?:\\'|[^'])*'|\"(?:\\\"|[^\"])*\")")
 
-    def _replace_number_literals(self, text: str) -> str:
-        nums = ["0", "1", "-1", "2", "-2", "0xFF", "1e3"]
-        def repl(m):
-            if random.random() < 0.5:
-                return random.choice(nums)
-            return m.group(0)
-        return re.sub(r"\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b", repl, text, flags=re.IGNORECASE)
+    JS_KEYWORDS = {
+        'await','break','case','catch','class','const','continue','debugger','default','delete',
+        'do','else','enum','export','extends','false','finally','for','function','if','import','in',
+        'instanceof','let','new','null','return','super','switch','this','throw','true','try','typeof',
+        'var','void','while','with','yield'
+    }
 
-    def _basic_balance_check(self, s: str) -> bool:
-        # 检查括号/方括号/大括号与引号的简单平衡
-        for o, c in [('(', ')'), ('[', ']'), ('{', '}')]:
-            if s.count(o) != s.count(c):
-                return False
-        for q in ['"', "'", '`']:
-            if _count_unescaped(s, q) % 2 != 0:
-                return False
-        return True
+    def __init__(self, seed: Optional[int] = None) -> None:
+        self.rng = random.Random(seed)
 
-    def mutate(self, data: bytes) -> Iterable[bytes]:
-        text = _decode_text(data)
-        if text is None:
-            return
+    def mutate(self, data: bytes, num_mutations: int = 1) -> bytes:
+        """对 mjs/JS 文本进行 num_mutations 次变异并返回 utf-8 编码的结果。
 
-        protected = _find_protected_spans(text)
-        variants = 0
+        若输入无法解码为文本，则回退到字节层简单变异。
+        """
+        try:
+            src = data.decode('utf-8')
+        except Exception:
+            return self._fallback_byte_mutation(data)
 
-        # 策略 A：在标识符边界插入字典 token
-        if variants < self.max_variants:
+        lines = src.splitlines(True)
+
+        for _ in range(num_mutations):
+            ops = [self._rename_identifier, self._tweak_number, self._corrupt_string,
+                   self._flip_operator, self._toggle_comment_line, self._insert_literal,
+                   self._swap_adjacent_lines]
+            op = self.rng.choice(ops)
             try:
-                new_text = self._insert_dict_token(text)
-                new_text = _fix_brackets_and_quotes(new_text)
-                if self._basic_balance_check(new_text):
-                    yield _encode_text(new_text, data)
-                    variants += 1
+                src = op(src, lines)
+                lines = src.splitlines(True)
             except Exception:
-                pass
-
-        # 策略 B：替换数字字面量
-        if variants < self.max_variants:
-            try:
-                new_text = self._replace_number_literals(text)
-                new_text = _fix_brackets_and_quotes(new_text)
-                if self._basic_balance_check(new_text):
-                    yield _encode_text(new_text, data)
-                    variants += 1
-            except Exception:
-                pass
-
-        # 策略 C：变异字符串字面量（单/双/反引号）
-        string_re = re.compile(r"(['\"])(.*?)(?<!\\)\1|(`)(.*?)(?<!\\)\3", flags=re.DOTALL)
-        for m in string_re.finditer(text):
-            if variants >= self.max_variants:
-                break
-            # 确定内部范围
-            if m.group(1):
-                inner = (m.start(2), m.end(2))
-                quote = m.group(1)
-            else:
-                inner = (m.start(4), m.end(4))
-                quote = '`'
-            if _is_in_spans(inner[0], protected):
                 continue
-            val = text[inner[0]:inner[1]]
-            per_span = 0
-            for mut in self.mutators:
-                if variants >= self.max_variants or per_span >= self.per_span_limit:
-                    break
-                try:
-                    for v in mut.mutate(val.encode('utf-8', errors='ignore')):
-                        if variants >= self.max_variants or per_span >= self.per_span_limit:
-                            break
-                        try:
-                            v_text = v.decode('utf-8')
-                        except Exception:
-                            v_text = v.decode('latin-1', errors='ignore')
-                        cand = text[:inner[0]] + v_text + text[inner[1]:]
-                        cand = _fix_brackets_and_quotes(cand)
-                        if not self._basic_balance_check(cand):
-                            continue
-                        yield _encode_text(cand, data)
-                        variants += 1
-                        per_span += 1
-                except Exception:
-                    continue
 
-        # 策略 D：对非保护的代码片段应用基础变异（按保护区分割）
-        if variants < self.max_variants:
-            spans = []
-            last = 0
-            for s, e in protected:
-                if last < s:
-                    spans.append((last, s))
-                last = e
-            if last < len(text):
-                spans.append((last, len(text)))
+        return src.encode('utf-8', errors='ignore')
 
-            for (s, e) in spans:
-                if variants >= self.max_variants:
-                    break
-                chunk = text[s:e]
-                per_span = 0
-                for mut in self.mutators:
-                    if variants >= self.max_variants or per_span >= self.per_span_limit:
-                        break
-                    try:
-                        for v in mut.mutate(chunk.encode('utf-8', errors='ignore')):
-                            if variants >= self.max_variants or per_span >= self.per_span_limit:
-                                break
-                            try:
-                                v_text = v.decode('utf-8')
-                            except Exception:
-                                v_text = v.decode('latin-1', errors='ignore')
-                            cand = text[:s] + v_text + text[e:]
-                            cand = _fix_brackets_and_quotes(cand)
-                            if not self._basic_balance_check(cand):
-                                continue
-                            yield _encode_text(cand, data)
-                            variants += 1
-                            per_span += 1
-                    except Exception:
-                        continue
+    def _fallback_byte_mutation(self, data: bytes) -> bytes:
+        b = bytearray(data)
+        if not b:
+            return data
+        i = self.rng.randrange(len(b))
+        b[i] = (b[i] + self.rng.randrange(1, 255)) & 0xFF
+        return bytes(b)
 
-        # 策略 E：在保留保护区的前提下执行小规模全局 Havoc
-        if variants < self.max_variants:
-            try:
-                h = HavocMutator(rounds=4, max_changes=6)
-                placeholder = '\uFFFD'
-                temp = list(text)
-                for s, e in protected:
-                    for i in range(s, e):
-                        temp[i] = placeholder
-                masked = ''.join(temp)
-                for v in h.mutate(masked.encode('utf-8', errors='ignore')):
-                    if variants >= self.max_variants:
-                        break
-                    try:
-                        v_text = v.decode('utf-8')
-                    except Exception:
-                        v_text = v.decode('latin-1', errors='ignore')
-                    out_chars = list(v_text)
-                    for s, e in protected:
-                        out_chars[s:e] = list(text[s:e])
-                    candidate = ''.join(out_chars)
-                    candidate = _fix_brackets_and_quotes(candidate)
-                    if not self._basic_balance_check(candidate):
-                        continue
-                    yield _encode_text(candidate, data)
-                    variants += 1
-            except Exception:
-                pass
+    def _rename_identifier(self, src: str, lines) -> str:
+        ids = list(self.IDENT_RE.finditer(src))
+        if not ids:
+            return src
+        m = self.rng.choice(ids)
+        name = m.group(1)
+        if name in self.JS_KEYWORDS:
+            return src
+        new = self._mutate_ident(name)
+        s, e = m.span(1)
+        return src[:s] + new + src[e:]
 
-        return
+    def _mutate_ident(self, s: str) -> str:
+        r = self.rng.random()
+        if r < 0.4 and len(s) > 1:
+            i = self.rng.randrange(len(s))
+            c = self.rng.choice('abcdefghijklmnopqrstuvwxyz0123456789_')
+            return s[:i] + c + s[i+1:]
+        elif r < 0.85:
+            return s + self.rng.choice(['_x','_v',str(self.rng.randrange(10,99))])
+        else:
+            return s[::-1]
+
+    def _tweak_number(self, src: str, lines) -> str:
+        nums = list(self.NUMBER_RE.finditer(src))
+        if not nums:
+            return src
+        m = self.rng.choice(nums)
+        val = m.group(1)
+        try:
+            if '.' in val:
+                f = float(val)
+                delta = self.rng.uniform(-10.0, 10.0)
+                new = str(f + delta)
+            else:
+                i = int(val)
+                delta = self.rng.randint(-50, 50)
+                new = str(max(0, i + delta))
+        except Exception:
+            new = val
+        s, e = m.span(1)
+        return src[:s] + new + src[e:]
+
+    def _corrupt_string(self, src: str, lines) -> str:
+        strs = list(self.STRING_RE.finditer(src))
+        if not strs:
+            return src
+        m = self.rng.choice(strs)
+        s = m.group(1)
+        quote = s[0]
+        inner = s[1:-1]
+        r = self.rng.random()
+        if r < 0.4 and inner:
+            i = self.rng.randrange(len(inner))
+            c = self.rng.choice('abcdefghijklmnopqrstuvwxyz0123456789')
+            new_inner = inner[:i] + c + inner[i+1:]
+        elif r < 0.8:
+            new_inner = inner + self._random_text(4)
+        else:
+            new_inner = ''
+        new = quote + new_inner + quote
+        start, end = m.span(1)
+        return src[:start] + new + src[end:]
+
+    def _flip_operator(self, src: str, lines) -> str:
+        # 简单替换关系/相等操作符以触发不同控制流
+        ops = [ ('===','=='), ('==','==='), ('!==','!='), ('!=','!=='), ]
+        a,b = self.rng.choice(ops)
+        if a in src:
+            return src.replace(a, b, 1)
+        # 次要尝试替换 <-> >
+        if '<' in src and '>' in src and self.rng.random() < 0.3:
+            # 交换首个出现的 < 和 >
+            src = src.replace('<','__LT__',1)
+            src = src.replace('>','<',1)
+            src = src.replace('__LT__','>',1)
+        return src
+
+    def _toggle_comment_line(self, src: str, lines) -> str:
+        if not lines:
+            return src
+        idx = self.rng.randrange(len(lines))
+        line = lines[idx]
+        stripped = line.lstrip()
+        prefix_len = len(line) - len(stripped)
+        if stripped.startswith('//'):
+            new_line = ' ' * prefix_len + stripped[2:]
+        else:
+            new_line = ' ' * prefix_len + '//' + stripped
+        new_lines = lines[:idx] + [new_line] + lines[idx+1:]
+        return ''.join(new_lines)
+
+    def _insert_literal(self, src: str, lines) -> str:
+        lits = ['undefined','null','0','false']
+        pos = self.rng.randrange(len(src)+1)
+        lit = self.rng.choice(lits)
+        return src[:pos] + ' ' + lit + ' ' + src[pos:]
+
+    def _swap_adjacent_lines(self, src: str, lines) -> str:
+        if len(lines) < 2:
+            return src
+        idx = self.rng.randrange(len(lines)-1)
+        new_lines = lines[:]
+        new_lines[idx], new_lines[idx+1] = new_lines[idx+1], new_lines[idx]
+        return ''.join(new_lines)
+
+    def _random_text(self, max_len: int = 6) -> str:
+        l = self.rng.randrange(1, max_len+1)
+        return ''.join(self.rng.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(l))
 
 
-__all__ = ["MjsMutator"]
+if __name__ == '__main__':
+    sample = """// example ES module
+export function add(a, b) {
+  const s = `sum: ${a+b}`
+  if (a === b) return true
+  return a + b
+}
+
+export const VALUE = 42
+"""
+    m = MjsMutator(seed=1234)
+    print('原始:')
+    print(sample)
+    for i in range(6):
+        out = m.mutate(sample.encode('utf-8'), num_mutations=2)
+        print(f'变异 {i+1}:')
+        print(out.decode('utf-8'))

@@ -182,24 +182,6 @@ ovelty（新增覆盖点数）和累计覆盖。
 		```
 	- 说明：上面命令在容器内运行时会每 5 秒覆盖性打印当前状态行；程序结束后会生成 `monitor_records.json` 与 `coverage_curve.csv`，并在终端打印最终统计信息。 
 
-## 专用变异器扩展（2025-12-25）
-
-2025-12-25：为提高对目标样本格式的语义感知和变异效率，新增一组格式专用变异器（位于 `mini_afl_py/mutators/`）：
-
-- `elf_mutator.py`：只变异 ELF 文件的节区（section）内容，保护 ELF 头与节表不被修改。实现要点：轻量解析 ELF32/ELF64 小端节表，跳过 SHT_NOBITS（.bss），对每个节调用已有基础变异器（`BitflipMutator`/`ArithMutator`/`InterestMutator`/`HavocMutator`），若变体长度与节大小不符则截断或以 0 填充以保持节大小一致。限制：为轻量实现，遇到复杂或非标准 ELF 时会静默跳过。
-
-- `lua_mutator.py`：针对 Lua 源码的文本级变异器。实现要点：保护前 N 行（如 shebang）、内置增强字典（Lua 关键字与常用 API）用于插入/替换、对数字与字符串进行有针对性的变异、变异后尝试修复括号与引号闭合以减少语法错误，并复用基础变异器生成更多变体。限制：采用简单文本策略，复杂语法验证/执行需后续扩展（可接入 Lua 解释器做语法检查）。
-
-- `xml_mutator.py`：针对 XML 的保守变异器。实现要点：保护 `<?xml ... ?>`、`<!DOCTYPE ...>`、注释与 CDATA 区域；检测并跳过常见十六进制校验和字段（32/40/64 长度）；仅对属性值与文本节点应用变异，变异结果在输出前通过 `xml.etree.ElementTree.fromstring()` 做 well-formedness 校验；变异同时对输出进行 XML 转义，保证结构完整。限制：不会主动修复或重写复杂校验和字段。
-
-- `mjs_mutator.py`：针对 ECMAScript 模块（`.mjs`）的变异器。实现要点：保护 shebang 与 `import`/`export` 行以及 `require(...)` 内的路径字符串，内置 JS 关键字/API 词典用于插入/替换，对字符串字面量与数值字面量以及非保护代码块调用基础变异器，变异后执行括号/引号闭合修复并进行简单平衡检查，只有通过简单平衡检查的候选才输出。限制：当前仅做文本级保护与平衡检查，语法级别的精确校验（如 AST 验证）为后续改进项。
-
-- `pcap_mutator.py`：针对 pcap 二进制抓包文件的变异器。实现要点：识别并保护全局头（24 字节）与每个 packet header（16 字节：ts_sec/ts_usec/incl_len/orig_len），仅对每个 packet 的 payload（incl_len 指定）调用基础变异器；变体保持原始 incl_len（通过截断或 0 填充），并提供 per-packet 与全局产出上限。限制：当前实现不重写或修正包内校验和（如 IP/TCP 校验和），且替换逻辑基于 payload 匹配，遇到多个相同 payload 的包时替换可能不按偏移精确定位（后续可改为记录偏移并精确替换）。
-
-- `png_mutator.py`：针对 PNG 图片文件的变异器。实现要点：以 PNG chunk（长度/类型/数据/CRC）为单位解析文件，保护关键头（PNG signature）与非数据元的 chunk 类型（如 IHDR、IEND）；对 `IDAT`、`tEXt` 和 `zTXt` 等数据或文本类 chunk 进行变异，变异后对被修改 chunk 重新计算 CRC 并替换，确保整体文件结构与 chunk 长度字段一致；当需要对 IDAT 内部像素数据做语义变异时，当前策略为直接在压缩数据上做字节级变更（保守策略），并记录为后续改进点（建议：解压/变异/再压缩以保持更合法的图像）。限制：直接修改压缩数据可能导致图像损坏或读取失败，但可触发解析器/解码器漏洞；更高质量变异需实现 IDAT 解压-变异-重压缩流程并正确更新相关长度与 CRC。
-
-- `jpeg_mutator.py`：针对 JPEG/JFIF/Exif 格式图像的变异器。实现要点：解析 JPEG marker 流（以 0xFFD8 SOI 开始，0xFFD9 EOI 结束），识别并保护 SOI、APPn（如 Exif）段与 SOS（Start Of Scan）之前的段元数据；对 SOS 到 EOI 之间的扫描数据（压缩熵编码部分）进行字节级变异以触发解码器在熵解码/去量化/逆变换阶段的潜在问题；变异时保留必要的段长度字段（当变更影响段长度时通过截断或填充保持一致性）并避免破坏 SOI/EOI 标记。限制：直接修改扫描数据常常产生不可解码的输出；更安全的高级策略包括解析 JPEG 到 MCU/系数层级并在系数级别进行变异（后续改进）。
-
 ## 重构记录：`fuzzer.py` 重构（2025-12-25）
 
 2025-12-25：对 `mini_afl_py/fuzzer.py` 进行了重构，目标是把原有的占位主循环扩展为一个可运行的最小 fuzz 引擎骨架，变更要点如下：
@@ -228,3 +210,42 @@ ovelty（新增覆盖点数）和累计覆盖。
 	- 使用 `mini_afl_py/instrumentation/shm_manager.py` 在容器中对目标进行了单次运行测试：`run_target_with_shm()` 生成的 map 文件长度为 256 字节，解析后 `parse_afl_map()` 返回覆盖点数 252（作为基线验证）。
 	- 在修复 `fuzzer.py` 的 `--target` 处理后，短跑 fuzz（shm 模式）显示监控导出文件 `monitor_records.json` 与 `coverage_curve.csv`，并能正确报告累计覆盖（cum_cov = 252）。
 	- 变异器功能通过静态检查与小规模本地 mutate 调用验证，不引入语法错误或运行时异常（已通过 Python 语法检查）。
+
+## 特化变异器实现记录（2025-12-26）
+
+本次开发中为若干目标格式添加了轻量且实用的特化变异器，目的在于在保持变异速度的同时提升触发有效路径或崩溃的概率。以下为已加入的变异器清单、文件位置与要点说明：
+
+- `ELF`：`MiniAFL/mini_afl_py/mutators/elf_mutator.py`
+	- 要点：轻量解析 ELF header 与 section table，优先对 ELF 头关键字段（entry、phoff、shoff、e_type 等）做小幅扰动；对字符串表（.strtab/.shstrtab）进行替换/交换/截断；对可执行节使用字节级 `bitflip`/`havoc`，对符号/字符串节使用字符串级变异。
+	- 设计目标：尽量保持 ELF 可解析性，变动有边界检查与 per-section 限制以避免爆炸性输出。
+
+- `JPEG`：`MiniAFL/mini_afl_py/mutators/jpeg_mutator.py`
+	- 要点：轻量解析 JPEG 段（marker/length），提供段级变异（截断到段边界、复制段、交换相邻段、破坏段长度字段）和段内字节翻转；解析失败时回退到字节级变异。
+	- 适用性：对 libjpeg 解码器与文件解析逻辑能触发格式相关崩溃或异常处理代码。
+
+- `Lua`：`MiniAFL/mini_afl_py/mutators/lua_mutator.py`
+	- 要点：针对脚本文本，提供标识符改名、数字微调、字符串破坏、行删除/注释切换、插入字面量与行交换等轻量策略；对非 UTF-8 输入回退到字节变异。
+	- 设计目标：在保持语法大致正确的前提下触发运行时逻辑错误或解析异常。
+
+- `MJS / ES module`：`MiniAFL/mini_afl_py/mutators/mjs_mutator.py`
+	- 要点：类似 JS 专用变异器，支持标识符扰动、数字/字符串微变、操作符替换（===/==、!==/!=）、行注释切换、插入字面量、相邻行交换。
+	- 目标：触发 JS 引擎或运行时在类型/相等/控制流上的不同路径。
+
+- `PCAP`：`MiniAFL/mini_afl_py/mutators/pcap_mutator.py`
+	- 要点：轻量解析 pcap global header 与 packet records，提供包级变异（截断到包、复制包、交换相邻包）、包内字节翻转与破坏 incl_len 字段，解析失败回退字节级变异。
+	- 适用场景：网络解析/回放工具、libpcap 解析器等。
+
+- `PNG`：`MiniAFL/mini_afl_py/mutators/png_mutator.py`
+	- 要点：解析 PNG chunk（长度/type/payload/crc），允许删除/复制/交换 chunk（保留 IHDR/IEND 保护）、在 payload 中翻转字节、破坏 chunk 长度或微调 IHDR 的宽高字段。
+	- 设计目标：在尽量保持文件可解析性的同时诱发解码器对异常长度/CRC/metadata 的不同处理路径。
+
+- `XML`：`MiniAFL/mini_afl_py/mutators/xml_mutator.py`
+	- 要点：使用 stdlib `xml.etree.ElementTree` 做轻量解析，提供标签插入/删除、属性扰动、文本微变、实体替换及解析回退（字节级变异）。
+	- 适用性：触发 XML 解析器在节点/属性/实体处理上的边界或异常路径。
+
+共同设计原则：
+
+- 轻量：尽量使用 Python 标准库进行快速解析（避免增加依赖），在变异循环中尽量保持低开销。
+- 可复现：变异器支持可选随机种子参数以便复现结果。
+- 回退安全：当针对性解析失败时，回退到简单的字节级变异以保证总能产出变体。
+- 示例/自测：每个变异器文件包含 `__main__` 示例用于本地快速验证（打印变异样例、长度/头尾摘要等）。

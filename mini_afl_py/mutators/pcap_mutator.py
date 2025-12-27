@@ -1,160 +1,155 @@
-"""
-PCAP 专用变异器
+"""轻量级 PCAP 变异器。
 
-说明：解析 pcap 全局头与每个 packet header（pcap/libpcap 格式），保护全局头与每个包的报头字段（ts_sec/ts_usec/incl_len/orig_len），只对 packet data 部分应用基础变异器。
+提供对常见 libpcap 文件格式的轻量解析与若干包级/字节级变异：
+- 截断到某包、复制包、包内字节翻转、交换相邻包、破坏包长度字段
 
-实现要点：
-- 支持常见 little-endian pcap magic (0xa1b2c3d4) 和 nanosecond variant (0xa1b23c4d)；
-- 对每个 packet data 使用已有变异器（Bitflip/Havoc/Arith/Interest）生成变体，保持 incl_len 大小不变（通过截断或填充）；
-- 提供每包产出上限与全局上限；
-- 对不可解析或异常数据安全返回（不抛异常）。
+仅使用标准库实现，适合高速模糊测试中的快速候选生成。
 """
 from __future__ import annotations
 
 import struct
-from typing import Iterable, List, Optional
-
-from .bitflip_mutator import BitflipMutator
-from .havoc_mutator import HavocMutator
-from .arith_mutator import ArithMutator
-from .interest_mutator import InterestMutator
+import random
+from typing import List, Tuple, Optional
 
 
 class PcapMutator:
-    """PCAP 文件级变异器。
+    """轻量 PCAP 变异器实现（支持 pcap 普通格式）。"""
 
-    参数：
-      mutators: 列表，基础变异器实例（若 None 则使用默认集合）
-      per_packet_limit: 每个 packet 最大产出变体数
-      max_variants: 全局最大产出变体数
-    """
+    def __init__(self, seed: Optional[int] = None) -> None:
+        self.rng = random.Random(seed)
 
-    def __init__(self, mutators: Optional[List] = None, per_packet_limit: int = 20, max_variants: int = 200):
-        if mutators is None:
-            mutators = [BitflipMutator(max_bits=256), ArithMutator(max_positions=64), InterestMutator(max_positions=64), HavocMutator(rounds=4, max_changes=6)]
-        self.mutators = mutators
-        self.per_packet_limit = int(per_packet_limit)
-        self.max_variants = int(max_variants)
-
-    def _parse_global_header(self, data: bytes):
-        # 全局头为 24 字节
-        if len(data) < 24:
-            return None
-        magic = data[0:4]
-        # 检测字节序与时间戳精度
-        # 常见的 magic 值：
-        # 0xa1b2c3d4（小端），0xd4c3b2a1（大端）
-        # 0xa1b23c4d（纳秒小端），0x4d3cb2a1（纳秒大端）
-        m = struct.unpack('<I', magic)[0]
-        if m == 0xa1b2c3d4 or m == 0xa1b23c4d:
-            endian = '<'
-        else:
-            # 尝试大端解析
-            m2 = struct.unpack('>I', magic)[0]
-            if m2 == 0xa1b2c3d4 or m2 == 0xa1b23c4d:
-                endian = '>'
-            else:
-                return None
-        # 解包全局头（大部分字段暂不使用，但保留头部字节）
-        return endian
-
-    def mutate(self, data: bytes) -> Iterable[bytes]:
+    def mutate(self, data: bytes, num_mutations: int = 1) -> bytes:
         try:
-            endian = self._parse_global_header(data)
+            global_hdr, packets = self._parse_pcap(data)
         except Exception:
-            endian = None
-        if endian is None:
-            return
+            return self._fallback_byte_mutation(data)
 
-        # 全局头（保持不变）
-        if len(data) < 24:
-            return
-        global_hdr = data[:24]
-        offset = 24
-        L = len(data)
-
-        variants = 0
-
-        # 遍历每个数据包记录
-        while offset + 16 <= L and variants < self.max_variants:
-            # 每包头字段：ts_sec(4), ts_usec(4), incl_len(4), orig_len(4)
+        out = bytearray(data)
+        for _ in range(num_mutations):
+            ops = [self._truncate_at_packet, self._flip_bytes_in_packet,
+                   self._duplicate_packet, self._swap_adjacent_packets,
+                   self._corrupt_incl_len]
+            op = self.rng.choice(ops)
             try:
-                ph = data[offset:offset+16]
-                ts_sec, ts_usec, incl_len, orig_len = struct.unpack(endian + 'IIII', ph)
+                out = op(out, global_hdr, packets)
+                # reparse after structural changes
+                global_hdr, packets = self._parse_pcap(bytes(out))
             except Exception:
-                break
-            offset += 16
-            if offset + incl_len > L:
-                # 数据格式异常，停止解析
-                break
-            packet_data = data[offset:offset+incl_len]
-            offset += incl_len
-
-            if not packet_data:
                 continue
 
-            per_pkt_count = 0
-            for mut in self.mutators:
-                if variants >= self.max_variants or per_pkt_count >= self.per_packet_limit:
-                    break
-                try:
-                    for v in mut.mutate(packet_data):
-                        if variants >= self.max_variants or per_pkt_count >= self.per_packet_limit:
-                            break
-                        if v is None:
-                            continue
-                        # 确保与原始 incl_len 相同长度
-                        if len(v) != incl_len:
-                            if len(v) > incl_len:
-                                v_use = v[:incl_len]
-                            else:
-                                v_use = v + b'\x00' * (incl_len - len(v))
-                        else:
-                            v_use = v
+        return bytes(out)
 
-                        # 构建新的 pcap：复制全局头和所有包记录，替换当前包的数据
-                        out = bytearray()
-                        out.extend(global_hdr)
+    def _parse_pcap(self, data: bytes) -> Tuple[dict, List[Tuple[int,int,int,int]]]:
+        # 返回 (global_header_dict, packets_list)
+        # packets_list 中每项为 (offset_ts_sec, offset_ts_usec, offset_incl_len, offset_data_start)
+        if len(data) < 24:
+            raise ValueError('too short')
+        magic = struct.unpack_from('<I', data, 0)[0]
+        if magic == 0xa1b2c3d4:
+            endian = '<'
+        elif magic == 0xd4c3b2a1:
+            endian = '>'
+        else:
+            # 不能识别的魔法数，尝试小端
+            endian = '<'
 
-                        # 再次迭代以重建文件内容
-                        roff = 24
-                        pkt_index = 0
-                        replaced = False
-                        while roff + 16 <= L:
-                            ph2 = data[roff:roff+16]
-                            try:
-                                ts2, tus2, il2, ol2 = struct.unpack(endian + 'IIII', ph2)
-                            except Exception:
-                                break
-                            roff += 16
-                            payload = data[roff:roff+il2]
-                            roff += il2
-                            if not replaced and pkt_index == per_pkt_count + 0:
-                                # 这种按索引定位的方法不够健壮；应通过比较原始 payload 来定位
-                                pass
-                            # 我们通过扫描并比较原始 payload 的方式进行替换；即在匹配到与原始 packet_data 相同位置时进行替换
-                            # 由于已捕获 packet_data，检查 payload 是否等于 packet_data 且尚未替换
-                            if (not replaced) and payload == packet_data:
-                                # 写入包头
-                                out.extend(ph2)
-                                out.extend(v_use)
-                                replaced = True
-                            else:
-                                out.extend(ph2)
-                                out.extend(payload)
-                            pkt_index += 1
+        # global header fields but we only need to know header size
+        # parse packet records
+        off = 24
+        n = len(data)
+        packets = []
+        while off + 16 <= n:
+            ts_sec, ts_usec, incl_len, orig_len = struct.unpack_from(endian + 'IIII', data, off)
+            data_start = off + 16
+            data_end = data_start + incl_len
+            if data_end > n:
+                # malformed, truncate parsing
+                break
+            packets.append((off, off+4, off+8, data_start))
+            off = data_end
 
-                        # 如果未能替换（不应发生），则跳过该变体
-                        if not replaced:
-                            continue
+        global_hdr = {'endian': endian}
+        return global_hdr, packets
 
-                        yield bytes(out)
-                        variants += 1
-                        per_pkt_count += 1
-                except Exception:
-                    continue
+    def _fallback_byte_mutation(self, data: bytes) -> bytes:
+        b = bytearray(data)
+        if not b:
+            return data
+        i = self.rng.randrange(len(b))
+        b[i] = (b[i] + self.rng.randrange(1,255)) & 0xFF
+        return bytes(b)
 
-        return
+    def _truncate_at_packet(self, out: bytearray, gh: dict, packets) -> bytearray:
+        if not packets:
+            return out
+        idx = self.rng.randrange(len(packets))
+        off = packets[idx][0]
+        return out[:off]
+
+    def _flip_bytes_in_packet(self, out: bytearray, gh: dict, packets) -> bytearray:
+        if not packets:
+            return out
+        pkt = self.rng.choice(packets)
+        data_start = pkt[3]
+        # get incl_len from header
+        incl_len = struct.unpack_from(gh['endian'] + 'I', out, pkt[2])[0]
+        if incl_len == 0:
+            return out
+        for _ in range(max(1, incl_len // 50)):
+            i = self.rng.randrange(data_start, data_start + incl_len)
+            out[i] = (out[i] ^ self.rng.randrange(1,256)) & 0xFF
+        return out
+
+    def _duplicate_packet(self, out: bytearray, gh: dict, packets) -> bytearray:
+        if not packets:
+            return out
+        pkt = self.rng.choice(packets)
+        start = pkt[0]
+        # compute incl_len
+        incl_len = struct.unpack_from(gh['endian'] + 'I', out, pkt[2])[0]
+        data_start = pkt[3]
+        data_end = data_start + incl_len
+        segment = out[start:data_end]
+        insert_at = data_end
+        return out[:insert_at] + segment + out[insert_at:]
+
+    def _swap_adjacent_packets(self, out: bytearray, gh: dict, packets) -> bytearray:
+        if len(packets) < 2:
+            return out
+        idx = self.rng.randrange(len(packets) - 1)
+        a_start = packets[idx][0]
+        a_incl = struct.unpack_from(gh['endian'] + 'I', out, packets[idx][2])[0]
+        a_data_start = packets[idx][3]
+        a_end = a_data_start + a_incl
+        b_start = packets[idx+1][0]
+        b_incl = struct.unpack_from(gh['endian'] + 'I', out, packets[idx+1][2])[0]
+        b_data_start = packets[idx+1][3]
+        b_end = b_data_start + b_incl
+        a_bytes = out[a_start:a_end]
+        b_bytes = out[b_start:b_end]
+        return out[:a_start] + b_bytes + a_bytes + out[b_end:]
+
+    def _corrupt_incl_len(self, out: bytearray, gh: dict, packets) -> bytearray:
+        if not packets:
+            return out
+        pkt = self.rng.choice(packets)
+        off_incl = pkt[2]
+        # set a new incl_len possibly larger or smaller
+        new_len = max(0, self.rng.randrange(0, 65535))
+        struct.pack_into(gh['endian'] + 'I', out, off_incl, new_len)
+        return out
 
 
-__all__ = ["PcapMutator"]
+if __name__ == '__main__':
+    # 最小 pcap 示例：global header + one empty packet
+    # 使用小端 magic 0xd4c3b2a1 for demonstration
+    global_hdr = struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
+    # one packet: ts_sec, ts_usec, incl_len, orig_len, data
+    pkt_hdr = struct.pack('<IIII', 0, 0, 4, 4)
+    pkt_data = b'ABCD'
+    example = global_hdr + pkt_hdr + pkt_data
+    m = PcapMutator(seed=1)
+    print('原始长度:', len(example))
+    for i in range(6):
+        out = m.mutate(example, num_mutations=2)
+        print(f'变异 {i+1}: 长度={len(out)}')
