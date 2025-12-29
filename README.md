@@ -146,7 +146,7 @@ nohup python3 -m mini_afl_py.fuzzer \
   --seeds /fuzz/T01/seeds \
   --outdir /fuzz/T01/output \
   --time 86400 \
-  --mode file \
+  --mode stdin \
   --timeout 5 \
   --status-interval 300 \
   > /fuzz/T01/output/fuzzer.log 2>&1 &

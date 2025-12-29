@@ -13,17 +13,23 @@ class SpliceMutator:
     """从给定语料池中选取另一条样本并在随机断点拼接。
 
     参数:
-      corpus: 可选的语料列表（bytes 序列）。
-      attempts: 每次 mutate 时尝试拼接的次数。
+        corpus: 可选的语料列表（bytes 序列）。
+        attempts: 每次 mutate 时尝试拼接的次数。
+        align: 对齐字节数（例如 2/4）以避免破坏多字节边界。
+        similarity_threshold: 选择拼接样本时希望与当前样本的最小不同度（0-1），越高越偏好差异更大的样本。
     """
 
-    def __init__(self, corpus: Sequence[bytes] = None, attempts: int = 8, min_out: int = 1, max_out: int = 4096):
+    def __init__(self, corpus: Sequence[bytes] = None, attempts: int = 8, min_out: int = 1, max_out: int = 4096, align: int = 1, similarity_threshold: float = 0.1):
         # 将语料保存为列表以便随机选择
         self.corpus = list(corpus) if corpus else []
         self.attempts = attempts
         # 输出长度限制，避免产生过长或过短样本
         self.min_out = min_out
         self.max_out = max_out
+        # 对齐边界（字节数），在选择断点时会对齐到此边界
+        self.align = max(1, int(align))
+        # 期望拼接对象与当前样本的最小差异比例（0..1）
+        self.similarity_threshold = float(similarity_threshold)
 
     def set_corpus(self, corpus: Sequence[bytes]):
         """更新语料池（可在运行时注入外部 corpus）。"""
@@ -38,30 +44,68 @@ class SpliceMutator:
         if not self.corpus:
             return
         for _ in range(self.attempts):
-            # 尝试挑选一个与当前不同的样本，避免无效自拼接
-            other = random.choice(self.corpus)
-            if not other or other == data:
-                # 如果语料中只有相同样本，允许继续但跳过空样本
+            # 尝试挑选一个与当前不同的样本，优先选择与当前差异度较高的样本
+            if not self.corpus:
+                return
+            candidates = self.corpus
+            # 随机采样若干候选以评估相似性
+            sample_k = min(len(candidates), 8)
+            sample = random.sample(candidates, sample_k)
+            # 计算简单相似度（前缀相同长度占比作为近似）
+            def similarity(a: bytes, b: bytes) -> float:
+                if not a or not b:
+                    return 0.0
+                # prefix length
+                m = min(len(a), len(b))
+                i = 0
+                while i < m and a[i] == b[i]:
+                    i += 1
+                return i / max(len(a), len(b))
+
+            # 从样本中尽量挑选与 data 相似度低于阈值的 other
+            other = None
+            random.shuffle(sample)
+            for cand in sample:
+                if cand is None or cand == data:
+                    continue
+                sim = similarity(data, cand)
+                if sim <= self.similarity_threshold:
+                    other = cand
+                    break
+            # 若未找到足够不同的，退回为任意不同样本
+            if other is None:
+                for cand in sample:
+                    if cand and cand != data:
+                        other = cand
+                        break
+            if other is None:
                 continue
 
             # 多种拼接策略：前缀+后缀、保持前缀、保持后缀、交叉
             strategy = random.choice(['prefix_suffix', 'keep_prefix', 'keep_suffix', 'crossover'])
             if strategy == 'prefix_suffix':
+                # 对断点应用对齐
                 a_split = random.randint(0, len(data))
+                a_split = (a_split // self.align) * self.align
                 b_split = random.randint(0, len(other))
+                b_split = (b_split // self.align) * self.align
                 out = data[:a_split] + other[b_split:]
             elif strategy == 'keep_prefix':
                 a_split = random.randint(0, len(data))
+                a_split = (a_split // self.align) * self.align
                 out = data[:a_split] + other
             elif strategy == 'keep_suffix':
                 b_split = random.randint(0, len(other))
+                b_split = (b_split // self.align) * self.align
                 out = data + other[b_split:]
             else:  # crossover
                 # 选择交叉点并拼接中间片段
                 if len(data) == 0 or len(other) == 0:
                     continue
                 a_split = random.randint(0, len(data)-1)
+                a_split = (a_split // self.align) * self.align
                 b_split = random.randint(1, len(other))
+                b_split = (b_split // self.align) * self.align
                 out = data[:a_split] + other[b_split:]
 
             # 长度约束过滤

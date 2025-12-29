@@ -100,6 +100,18 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 	import random as _rnd
 	if basic_mutators is None:
 		basic_mutators = [BitflipMutator(), ArithMutator(), InterestMutator(), HavocMutator(), SpliceMutator()]
+
+	# 覆盖增长检测（用于决定是否优先使用基础变异器以探索新种）
+	cov_last = 0
+	cov_check_interval = 10.0  # seconds
+	last_cov_check = start_ts
+	prefer_basic = False
+
+	# 内置激进默认（基于测试脚本的观察）
+	# - 每次 mutate() 处理更多变体以提高触发率
+	# - 对单个候选应用更多 attempts 以做局部深入搜索
+	max_variants = 50
+	max_attempts = 8
 	
 	try:
 		# 主循环：选择候选 -> 生成变体 -> 执行 -> 记录
@@ -113,37 +125,73 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 				time.sleep(0.2)
 				continue
 
-			# 根据种子内容检测格式并选择专用变异器（若存在）；否则回退到基础变异器
-			mutator_obj = None
+			# 周期性评估覆盖增长，若增长缓慢则提高基础变异器优先级
+			now = time.time()
+			if (now - last_cov_check) >= cov_check_interval:
+				try:
+					cov_now = len(getattr(monitor, 'cumulative_cov', []))
+				except Exception:
+					cov_now = 0
+				delta = cov_now - cov_last
+				elapsed = now - last_cov_check if (now - last_cov_check) > 0 else 1.0
+				growth_rate = float(delta) / elapsed
+				# 阈值：当每秒新增 edge 低于 0.02 且窗口内新增少于 2 条时，认为增长缓慢
+				if growth_rate < 0.02 and delta < 2:
+					prefer_basic = True
+				else:
+					prefer_basic = False
+				cov_last = cov_now
+				last_cov_check = now
+
+			# 根据种子内容检测格式并准备专用变异器（若存在）
+			spec_mutator = None
 			seed_fmt = format_detector.detect_from_bytes(cand.data)
 			if seed_fmt == 'elf':
-				mutator_obj = ElfMutator()
+				spec_mutator = ElfMutator()
 			elif seed_fmt in ('jpeg', 'jpg'):
-				mutator_obj = JpegMutator()
+				spec_mutator = JpegMutator()
 			elif seed_fmt == 'lua':
-				mutator_obj = LuaMutator()
+				spec_mutator = LuaMutator()
 			elif seed_fmt == 'mjs':
-				mutator_obj = MjsMutator()
+				spec_mutator = MjsMutator()
 			elif seed_fmt == 'pcap':
-				mutator_obj = PcapMutator()
+				spec_mutator = PcapMutator()
 			elif seed_fmt == 'png':
-				mutator_obj = PngMutator()
+				spec_mutator = PngMutator()
 			elif seed_fmt == 'xml':
-				mutator_obj = XmlMutator()
+				spec_mutator = XmlMutator()
 
 			import random as _rnd
+			# attempts 由候选 energy 决定，但受内置上限约束以避免过度爆炸
 			attempts = int(getattr(cand, 'energy', 1) or 1)
-			attempts = max(1, min(8, attempts))
+			attempts = max(1, min(max_attempts, attempts))
 
 			for _attempt in range(attempts):
 				try:
-					if mutator_obj is not None:
-						gen = mutator_obj.mutate(cand.data)
+					# 选择变异器策略：若存在专用变异器，则把基础变异器也纳入候选
+					if spec_mutator is not None:
+						# 当覆盖增长缓慢时优先基础变异器以探索新种；否则优先专用变异器
+						if prefer_basic:
+							# 80% 概率使用基础变异器，20% 使用专用变异器（保持多样性）
+							if _rnd.random() < 0.8:
+								chosen = _rnd.choice(basic_mutators)
+							else:
+								chosen = spec_mutator
+						else:
+							# 70% 概率使用专用变异器，30% 使用基础变异器（保持多样性）
+							if _rnd.random() < 0.7:
+								chosen = spec_mutator
+							else:
+								chosen = _rnd.choice(basic_mutators)
+						gen = chosen.mutate(cand.data)
 					else:
-						mut = _rnd.choice(basic_mutators)
-						gen = mut.mutate(cand.data)
+						# 仅基础变异器可用时随机选择一个
+						chosen = _rnd.choice(basic_mutators)
+						gen = chosen.mutate(cand.data)
 
 					count_v = 0
+					# 使用内置的 max_variants（激进值）
+					# max_variants 已在外部定义
 					for variant in gen:
 						if variant is None:
 							continue
@@ -170,7 +218,7 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 							pass
 
 						count_v += 1
-						if count_v >= 4:
+						if count_v >= max_variants:
 							break
 
 					if time.time() >= end_ts:

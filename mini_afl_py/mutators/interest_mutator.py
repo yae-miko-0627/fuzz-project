@@ -5,8 +5,9 @@ Interesting-values mutator
 
 用途：有趣值通常能触发边界条件、溢出或特殊逻辑分支。
 """
-from typing import Iterable
+from typing import Iterable, Optional, Sequence
 import struct
+import random
 
 
 class InterestMutator:
@@ -20,9 +21,13 @@ class InterestMutator:
     INTERESTING_16 = [0, 1, 0x7fff, 0x8000, 0xffff]
     INTERESTING_32 = [0, 1, 0x7fffffff, 0x80000000, 0xffffffff]
 
-    def __init__(self, max_positions: int = 32):
+    def __init__(self, max_positions: int = 32, extra_values: Sequence[int] = None, endian: str = 'little'):
         # 限制尝试替换的位置数，避免对长输入做全覆盖
         self.max_positions = max_positions
+        # 支持额外的有趣值集合（例如从字典/项目中提取的边界值）
+        self.extra_values = list(extra_values) if extra_values else []
+        # 端序，可用于 pack/unpack
+        self.endian = endian
 
     def _replace_word(self, data: bytearray, off: int, size: int, value: int):
         """在偏移 off 处以宽度 size 替换为 value，返回新的 bytes 或 None。
@@ -32,7 +37,7 @@ class InterestMutator:
         if off + size > len(data):
             return None
         out = bytearray(data)
-        fmt = {1: 'B', 2: '<H', 4: '<I'}[size]
+        fmt = {1: 'B', 2: ('<H' if self.endian == 'little' else '>H'), 4: ('<I' if self.endian == 'little' else '>I')}[size]
         if size == 1:
             out[off] = value & 0xFF
         else:
@@ -44,25 +49,38 @@ class InterestMutator:
         if not data:
             return
         max_pos = min(len(data), self.max_positions)
-        # 单字节替换
+        # 单字节替换（包含额外有趣值以及 +/-1 邻近变体）
         for pos in range(max_pos):
-            for v in self.INTERESTING_8:
+            pool8 = list(self.INTERESTING_8) + [v & 0xFF for v in self.extra_values]
+            for v in pool8:
                 res = self._replace_word(bytearray(data), pos, 1, v)
                 if res is not None:
                     yield res
+                # 邻近值
+                for off in (-1, 1):
+                    nv = (v + off) & 0xFF
+                    res2 = self._replace_word(bytearray(data), pos, 1, nv)
+                    if res2 is not None:
+                        yield res2
         # 2 字节替换（按可能的起始位置尝试）
+        # 2 字节替换（尝试常用值与其 +/-1 邻近、并为 signed 视角添加符号边界）
         for pos in range(0, len(data)-1):
             if pos >= self.max_positions:
                 break
-            for v in self.INTERESTING_16:
-                res = self._replace_word(bytearray(data), pos, 2, v)
-                if res is not None:
-                    yield res
+            pool16 = list(self.INTERESTING_16) + [v & 0xFFFF for v in self.extra_values]
+            for v in pool16:
+                for v2 in (v, (v - 1) & 0xFFFF, (v + 1) & 0xFFFF):
+                    res = self._replace_word(bytearray(data), pos, 2, v2)
+                    if res is not None:
+                        yield res
         # 4 字节替换
+        # 4 字节替换（包含一些负数/边界值的变体）
         for pos in range(0, len(data)-3):
             if pos >= self.max_positions:
                 break
-            for v in self.INTERESTING_32:
-                res = self._replace_word(bytearray(data), pos, 4, v)
-                if res is not None:
-                    yield res
+            pool32 = list(self.INTERESTING_32) + [v & 0xFFFFFFFF for v in self.extra_values]
+            for v in pool32:
+                for v2 in (v, (v - 1) & 0xFFFFFFFF, (v + 1) & 0xFFFFFFFF):
+                    res = self._replace_word(bytearray(data), pos, 4, v2)
+                    if res is not None:
+                        yield res

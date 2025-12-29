@@ -66,14 +66,13 @@ class Monitor:
                         artifact_path=artifact_path)
         self.records.append(rec)
 
-        # 保存特殊样本：crash/hang 或 novelty 超阈值
-        if status in ("crash", "hang") or novelty >= self.novelty_threshold:
-            fname = f"sample_{int(ts*1000)}_{status}.bin"
+        # 仅保存高新颖度样本以避免输出目录被大量 crash/hang 填满
+        if novelty >= self.novelty_threshold:
+            fname = f"sample_{int(ts*1000)}_novel.bin"
             p = os.path.join(self.out_dir, fname)
             try:
                 with open(p, "wb") as f:
                     f.write(sample)
-                # 若没有 artifact_path，记录文件路径
                 if artifact_path is None:
                     artifact_path = p
                 rec.artifact_path = artifact_path
