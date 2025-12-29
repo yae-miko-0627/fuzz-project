@@ -157,19 +157,26 @@ tail -n 200 -f /fuzz/T01/output/fuzzer.log
 
 T02（示例，带 `readelf -a @@ @@` 完整参数）：
 ```bash
-rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output
-
-nohup python3 -m mini_afl_py.fuzzer \
+# 容器内直接运行（前台，30s，file 模式，使用已有 seeds 目录）
+rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output /fuzz/T02/output/monitor_artifacts
+cd /fuzz && python3 -u MiniAFL/mini_afl_py/fuzzer.py \
   --target "/fuzz/T02/build/readelf -a @@ @@" \
   --seeds /fuzz/T02/seeds \
   --outdir /fuzz/T02/output \
-  --time 86400 \
+  --time 30 \
   --mode file \
   --timeout 5 \
-  --status-interval 300 \
-  > /fuzz/T02/output/fuzzer.log 2>&1 &
+  --status-interval 5
+```
 
-tail -n 200 -f /fuzz/T02/output/fuzzer.log
+```powershell
+# PowerShell（宿主）: 前台运行 30s（file 模式），不要覆盖已有种子目录
+docker exec -i fuzz_T02 bash -lc "rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output /fuzz/T02/output/monitor_artifacts; cd /fuzz && python3 -u MiniAFL/mini_afl_py/fuzzer.py --target '/fuzz/T02/build/readelf -a @@ @@' --seeds /fuzz/T02/seeds --outdir /fuzz/T02/output --mode file --time 30 --status-interval 5"
+```
+
+```powershell
+# PowerShell（宿主）: 后台运行 24 小时，日志写入 output/fuzzer.log（保留现有 seeds，不要用 printf 覆盖）
+docker exec -d fuzz_T02 bash -lc "rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output /fuzz/T02/output/monitor_artifacts; cd /fuzz && nohup python3 -u MiniAFL/mini_afl_py/fuzzer.py --target '/fuzz/T02/build/readelf -a @@ @@' --seeds /fuzz/T02/seeds --outdir /fuzz/T02/output --mode file --time 86400 --status-interval 60 > /fuzz/T02/output/fuzzer.log 2>&1 &"
 ```
 
 注意：上面命令为示例，若在容器外用 `docker exec` 启动，请在命令前加入 `docker exec -d <container> bash -lc "cd /fuzz && ..."` 将命令放到容器内部执行。

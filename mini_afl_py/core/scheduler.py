@@ -55,39 +55,45 @@ class Scheduler:
 
     def __init__(self) -> None:
         self._next_id = 1
-        self._corpus: Dict[int, Candidate] = {}
-        self._queue: List[int] = []
-        # favored 映射：候选 id -> 最近一次被标记/选中的时间戳
-        # 用于短期优先（带 TTL 与容量限制）
-        self._favored: Dict[int, float] = {}
+        self._corpus = {}  # type: Dict[int, Candidate]
+        self._queue = []  # type: List[int]
+        # favored 映射：候选 id -> 最近一次被标记/选中的时间戳（短期优先）
+        self._favored = {}
+
         # 调度统计与策略参数
         self._select_count = 0
         self._shuffle_interval = 200  # 每多少次选择对队列做一次洗牌以打破长期霸占
-        self._decay_rate = 0.90       # 兼容保留（默认，不再直接使用）
+
         # 差异化能量衰减：无新颖样本时更快衰减，有新颖样本保留更多
         self._decay_no_novelty = 0.8
         self._decay_with_novelty = 0.95
         self._max_energy_cap = 20     # 能量上限，避免单个样本长期垄断
+
         # 强制探索比例：以一定概率优先抽取低 cycles（新的）种子
         self._explore_fraction = 0.15
+
         # 动态探索参数
         self._explore_default = 0.15
         self._explore_min = 0.05
         self._explore_max = 0.30
         self._explore_stagnant = 0.30  # 覆盖停滞时提升到 30%
+
         # 探索池大小：默认较小，停滞时扩大
         self._explore_pool_size = 8
         self._explore_pool_size_stagnant = 32
         self._explore_pool_size_max = 64
+
         # 覆盖增长检测
         self._cov_check_interval = 10.0  # seconds
         self._last_cov_check = time.time()
         self._last_cov_points = 0
+
         # 累计覆盖（edge id 集合），用于计算 novelty
         self.cumulative_cov = CoverageData()
+
         # favored 策略参数
         self._favored_ttl = 30.0   # seconds: 若 30s 未被选中则移除
-        self._favored_capacity = 20 # 最多保留多少 favored 条目
+        self._favored_capacity = 20  # 最多保留多少 favored 条目
 
     def add_seed(self, seed: bytes, energy: int = 1) -> int:
         """将种子加入语料池并返回分配的 id。"""
@@ -454,7 +460,7 @@ class Scheduler:
 
         # 新颖度加成（短期强推）
         try:
-            novelty_boost = min(getattr(cand, 'last_novelty', 0) * 5.0, 200.0)
+            novelty_boost = min(getattr(cand, 'last_novelty', 0) * 8.0, 200.0)
         except Exception:
             novelty_boost = 0.0
         score += novelty_boost
