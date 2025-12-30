@@ -39,6 +39,9 @@ class Candidate:
     last_novelty: int = 0
     # 覆盖特征签名（字符串），用于基于覆盖的唯一性判定
     cov_sig: Optional[str] = None
+    # score 缓存：减少重复计算（用于周期性 prune）
+    _cached_score: float = 0.0
+    _cached_score_ts: float = 0.0
 
 
 class Scheduler:
@@ -57,8 +60,12 @@ class Scheduler:
         self._next_id = 1
         self._corpus = {}  # type: Dict[int, Candidate]
         self._queue = []  # type: List[int]
+        # 覆盖签名索引：cov_sig -> candidate id（加速重复样本匹配）
+        self._covsig_index = {}
         # favored 映射：候选 id -> 最近一次被标记/选中的时间戳（短期优先）
         self._favored = {}
+        # 归档（被裁剪的样本）保留引用以便必要时恢复
+        self._archived = {}  # type: Dict[int, Candidate]
 
         # 调度统计与策略参数
         self._select_count = 0
@@ -94,6 +101,10 @@ class Scheduler:
         # favored 策略参数
         self._favored_ttl = 30.0   # seconds: 若 30s 未被选中则移除
         self._favored_capacity = 20  # 最多保留多少 favored 条目
+        # corpus 裁剪配置：当 corpus 超过此大小时触发 prune
+        self._max_corpus_size = 2000
+        # 裁剪保留数量比例（保留 top_k 和 favored）
+        self._prune_reserve = 0.05  # 保留 5% 作为随机/探索缓冲
 
     def add_seed(self, seed: bytes, energy: int = 1) -> int:
         """将种子加入语料池并返回分配的 id。"""
@@ -108,8 +119,91 @@ class Scheduler:
         self._next_id += 1
         cand = Candidate(id=cid, data=seed, energy=energy, cycles=0, cov_sig=None)
         self._corpus[cid] = cand
+        # 若有 cov_sig（通常为空），记录到索引
+        try:
+            if cand.cov_sig:
+                self._covsig_index[cand.cov_sig] = cid
+        except Exception:
+            pass
         self._queue.append(cid)
         return cid
+
+    def _prune_corpus(self) -> None:
+        """当 corpus 超过阈值时执行裁剪：保留 top-K（按 score）、所有 favored 以及少量随机样本。
+
+        被裁剪的候选将被移动到 `_archived`，并从 `_corpus` / `_queue` / `_covsig_index` 中移除。
+        此操作不丢弃数据，仅把活跃集合大小限制在 _max_corpus_size 以内以控制调度成本。
+        """
+        try:
+            total = len(self._corpus)
+            if total <= self._max_corpus_size:
+                return
+            # 计算保留数量
+            reserve = max(1, int(self._max_corpus_size * (1.0 - self._prune_reserve)))
+            # 先收集 favored ids
+            favored_ids = set([i for i in self._favored.keys() if i in self._corpus])
+            # 计算所有候选分数（一次性），并利用缓存弱化开销
+            scores = []
+            now = time.time()
+            for cid, cand in self._corpus.items():
+                # 若缓存过期（例如 30s）或属性变化明显，重新计算
+                recalc = False
+                if now - getattr(cand, '_cached_score_ts', 0.0) > 30.0:
+                    recalc = True
+                if recalc or getattr(cand, '_cached_score', 0.0) == 0.0:
+                    s = self.calculate_score(cand)
+                    cand._cached_score = s
+                    cand._cached_score_ts = now
+                else:
+                    s = cand._cached_score
+                scores.append((cid, s))
+
+            # 排序并选择 top-N（按 score 降序）
+            scores.sort(key=lambda x: x[1], reverse=True)
+            keep = [cid for cid, _ in scores[:reserve]]
+            keep_set = set(keep) | favored_ids
+
+            # 为保证探索性，保留少量随机样本
+            import random as _rnd
+            extra = max(1, int(self._max_corpus_size * self._prune_reserve))
+            all_ids = list(self._corpus.keys())
+            rnd_pool = [i for i in all_ids if i not in keep_set]
+            if rnd_pool:
+                rnd_keep = set(_rnd.sample(rnd_pool, min(len(rnd_pool), extra)))
+                keep_set |= rnd_keep
+
+            # 计算需要移除的 id 列表
+            remove_ids = [cid for cid in list(self._corpus.keys()) if cid not in keep_set]
+            if not remove_ids:
+                return
+
+            # 执行移除
+            for rid in remove_ids:
+                try:
+                    cand = self._corpus.pop(rid, None)
+                    if cand is None:
+                        continue
+                    # 保存到 archive
+                    self._archived[rid] = cand
+                    # 从队列移除
+                    try:
+                        if rid in self._queue:
+                            self._queue.remove(rid)
+                    except Exception:
+                        pass
+                    # 从 covsig 索引移除
+                    try:
+                        if cand.cov_sig and cand.cov_sig in self._covsig_index:
+                            try:
+                                del self._covsig_index[cand.cov_sig]
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def next_candidate(self) -> Optional[Candidate]:
         """返回下一个候选 `Candidate`（轮询）或 None（队列空）。
@@ -118,6 +212,12 @@ class Scheduler:
         """
         if not self._queue:
             return None
+        # 若 corpus 过大，触发周期性裁剪以控制后续调度开销
+        try:
+            if len(self._corpus) > getattr(self, '_max_corpus_size', 0):
+                self._prune_corpus()
+        except Exception:
+            pass
         # 维护选择计数，每隔若干次做能量衰减与队列洗牌，防止长期垄断
         self._select_count += 1
         if self._select_count % self._shuffle_interval == 0:
@@ -307,23 +407,81 @@ class Scheduler:
         cov = getattr(result, "coverage", None)
         cov_sig = None
         if cov and isinstance(cov, CoverageData):
-            # 计算新颖点：cov.points - cumulative_cov.points
             try:
-                new_points = set(cov.points) - set(self.cumulative_cov.points)
-                novelty = len(new_points)
-                # 合并到累计覆盖
-                self.cumulative_cov.merge(cov)
-                # 计算覆盖位图签名以用于唯一性判断（sha1）
+                # 先计算覆盖签名（用于快速匹配）
                 try:
                     bm = cov.to_bitmap()
                     cov_sig = hashlib.sha1(bytes(bm)).hexdigest()
                 except Exception:
                     cov_sig = None
+                # 使用位图合并并计数新增点（高性能）
+                try:
+                    novelty = self.cumulative_cov.merge_and_count_new(cov)
+                except Exception:
+                    # 回退到集合合并（兼容）
+                    try:
+                        new_points = set(cov.points) - set(self.cumulative_cov.points)
+                        novelty = len(new_points)
+                        self.cumulative_cov.merge(cov)
+                    except Exception:
+                        novelty = 0
             except Exception:
                 novelty = 0
 
         # 使用覆盖签名判断样本是否已在语料池中（仅当两者都有覆盖签名且相同则视为重复）
         # 注意：不再使用字节级回退匹配，以避免把覆盖不同但字节相同的样本误判为重复。
+        # 如果有覆盖签名，优先用索引 O(1) 查找已有候选
+        if cov_sig and cov_sig in self._covsig_index:
+            cid = self._covsig_index.get(cov_sig)
+            cand = self._corpus.get(cid)
+            is_same = cand is not None
+            if is_same:
+                # 更新平均执行时间（简单指数移动平均）
+                try:
+                    t = float(getattr(result, "wall_time", 0.0) or getattr(result, 'exec_time', 0.0) or 0.0)
+                except Exception:
+                    t = 0.0
+                if cand.avg_exec_time <= 0.0:
+                    cand.avg_exec_time = t
+                else:
+                    alpha = 0.3
+                    cand.avg_exec_time = alpha * t + (1 - alpha) * cand.avg_exec_time
+                cand.hits += 1
+                # 若观察到新覆盖位点（novelty），适度提升能量（有上限）
+                if novelty and novelty > 0:
+                    boost = int(2 + novelty)
+                    # 以线性增加能量，但不超过全局上限
+                    try:
+                        cand.energy = min(self._max_energy_cap, int(cand.energy + boost))
+                    except Exception:
+                        cand.energy = min(self._max_energy_cap, 1 + boost)
+                    try:
+                        cand.last_novelty = int(novelty)
+                    except Exception:
+                        cand.last_novelty = 0
+                    # 标记为 favored（记录时间戳），便于后续优先探索（短期）
+                    try:
+                        self._favored[cid] = time.time()
+                    except Exception:
+                        pass
+                # 对于 crash/hang，不给予过高能量奖励以避免资源倾斜
+                if status in ("crash", "hang"):
+                    # 将能量限制在一个较低区间，允许继续探索但不放大优先级
+                    try:
+                        cand.energy = max(1, min(cand.energy, 3))
+                    except Exception:
+                        cand.energy = 1
+                else:
+                    # 依据新的统计重新计算能量
+                    # 使用 calculate_score 的结果但施加能量上限
+                    try:
+                        cand_energy = max(1, int(self.calculate_score(cand)))
+                        cand.energy = min(self._max_energy_cap, cand_energy)
+                    except Exception:
+                        cand.energy = 1
+                return cid
+
+        # 否则回退到遍历（极少发生）
         for cid, cand in list(self._corpus.items()):
             is_same = False
             try:
@@ -391,6 +549,10 @@ class Scheduler:
             try:
                 if cov_sig:
                     self._corpus[cid].cov_sig = cov_sig
+                    try:
+                        self._covsig_index[cov_sig] = cid
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # 新加入条目也标记其最近新颖度

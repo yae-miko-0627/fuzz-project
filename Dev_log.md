@@ -280,3 +280,44 @@ ovelty（新增覆盖点数）和累计覆盖。
 	- 新增覆盖增长检测（10s 窗口，阈值可调）：周期性计算 `cumulative_cov` 的增长速率（edges/s）并设定布尔标志 `prefer_basic` 表示当前是否应优先使用基础变异器探索。
 	- 当种子被识别为某些特化格式（如 `elf`, `jpeg`, `png` 等）时，除了使用对应的特化变异器外，还把基础变异器集合（`Bitflip`, `Arith`, `Interest`, `Havoc`, `Splice`）纳入候选池：
 	- 该逻辑通过小改动实现（决定变异器的 `chosen` 对象），并保留原有的 `max_variants` / `max_attempts` 控制以避免输出爆炸。
+
+## 测试日志：T01与T02 24h测试（2025-12-30）
+完成了T01与T02的24h测试，但是因为忘记关电脑的自动休眠了，所以凌晨后台测试被强行暂停了
+
+## 实现日志：覆盖与调度器性能优化（2025-12-30）
+
+2025-12-30：为了解决在长时间 fuzz 运行中出现的速率衰减（随累计覆盖和语料池增长导致的 CPU/内存与调度开销上升），对覆盖表示与调度器做了以下优化：
+
+- 目的：把随着时间线性增加的集合运算和遍历开销改为固定/可控的成本，从而在长跑中维持较稳定的执行速率。
+
+- 修改文件：
+	- `mini_afl_py/instrumentation/coverage.py`
+	- `mini_afl_py/core/scheduler.py`
+
+- 关键实现要点：
+	1) 覆盖数据改为位图为主（`CoverageData`）：
+		 - 用固定长度 `bytearray` 存储覆盖位点，新增 `merge_and_count_new()` 方法用于按位合并并返回新增命中数；
+		 - 延迟构建 `points` 集合视图，仅在需要时生成，避免频繁的大集合差集计算。
+	2) 覆盖签名索引（`cov_sig` -> candidate id）：
+		 - 在 `Scheduler` 中维护覆盖位图的 SHA1 签名索引，优先用索引做 O(1) 匹配，避免每次遍历语料池查找重复覆盖样本。
+	3) 控制活跃语料池大小（prune）：
+		 - 新增 `Scheduler._prune_corpus()`：当活跃 `corpus` 超过 `_max_corpus_size`（默认 2000）时触发裁剪；保留 top-K（按 score）、所有 `favored`、少量随机样本作为探索缓冲；其余样本移至 `_archived`（可恢复/检查）；
+		 - 在 `next_candidate()` 入口处周期性调用裁剪，保证调度、评分与遍历等操作的复杂度被限制在可控范围内。
+	4) Score 缓存与批量计算：
+		 - 为 `Candidate` 添加局部 score 缓存与时间戳；裁剪时批量刷新缓存（例如 30s 一次）以减少重复计算开销。
+
+- 预期效果与验证要点：
+	- 将 `novelty` 计算从集合差集 (O(n_points)) 降低为位图按位操作 (O(bitmap_size))，并把重复样本匹配从 O(n_corpus) 降到 O(1)（大多数情况下）；
+	- 限制活跃 `corpus` 大小可显著降低 `next_candidate()` 中的排序、评分与遍历成本，从而缓解长期运行中执行速率逐渐下降的问题；
+	- 被裁剪样本保留在 `_archived`，可按需写盘或延迟恢复，避免数据丢失。
+
+## 实现日志：CSV 到 X/Y 绘图工具（2025-12-30）
+
+2025-12-30：在 `mini_afl_py/utils` 下添加 `csv_to_xy_plot.py`，用于将 CSV 数据导出为 x-y 图（支持 `line` 与 `scatter`）。
+
+- 文件位置：`MiniAFL/mini_afl_py/utils/csv_to_xy_plot.py`
+- 主要功能：
+	- 支持通过列名或列索引（从0开始）指定 `--x` 与 `--y`；`--y` 支持逗号分隔多列
+	- 支持自定义分隔符 `-d`、输出文件 `-o`、图类型 `--kind`（line/scatter）、matplotlib 风格 `--style`
+	- 支持对数坐标 `--xlog/--ylog`、输出分辨率 `--dpi` 及点标记 `--marker`
+	- 若安装 `pandas` 会使用其读取 CSV，未安装则回退到标准库 `csv` 解析

@@ -38,6 +38,8 @@ class Monitor:
         os.makedirs(self.out_dir, exist_ok=True)
         self.records: List[RunRecord] = []
         self.cumulative_cov = CoverageData()
+        # 缓存累计覆盖大小，避免每次访问遍历位图（昂贵）
+        self._cum_cov_size = 0
         self.novelty_threshold = novelty_threshold
 
     def record_run(self, sample_id: Optional[int], sample: bytes, status: str,
@@ -52,13 +54,19 @@ class Monitor:
         ts = time.time()
         novelty = 0
         if cov is not None:
-            # 计算新颖点数：cov.points - cumulative.points
-            new_points = set(cov.points) - set(self.cumulative_cov.points)
-            novelty = len(new_points)
-            # 合并到累计
-            self.cumulative_cov.merge(cov)
+            # 使用 CoverageData.merge_and_count_new 做按位合并并直接获取新增命中数，
+            # 避免把位图转换为大集合（每次 65536 次迭代）的开销。
+            try:
+                novelty = self.cumulative_cov.merge_and_count_new(cov)
+            except Exception:
+                # 退回兼容实现（不应常发生）
+                new_points = set(cov.points) - set(self.cumulative_cov.points)
+                novelty = len(new_points)
+                self.cumulative_cov.merge(cov)
+            # 更新缓存的累计覆盖大小
+            self._cum_cov_size += novelty
 
-        cum_cov_size = len(self.cumulative_cov.points)
+        cum_cov_size = self._cum_cov_size
 
         rec = RunRecord(timestamp=ts, sample_id=sample_id, status=status,
                         wall_time=wall_time, novelty=novelty,

@@ -188,6 +188,21 @@ docker exec -d fuzz_T02 bash -lc "rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/
 - `--target` 替换为实际产物路径（如 `/fuzz/T01/build/cxxfilt`）。
 - 长时间运行建议在 tmux/screen 中执行，避免会话中断。
 
+# 工具：CSV → X/Y 绘图（mini_afl_py/utils/csv_to_xy_plot.py）
+
+项目内已新增一个小工具用于把 CSV 导出为 x-y 图像：`MiniAFL/mini_afl_py/utils/csv_to_xy_plot.py`。
+
+主要说明：
+
+- 依赖：`matplotlib`（必须），`pandas`（可选，推荐用于复杂 CSV）
+- 功能：支持通过列名或列索引指定 `--x` 与 `--y`，`--y` 支持多列（逗号分隔）；支持 `line` / `scatter`，自定义分隔符 `-d`，输出文件 `-o`，matplotlib 风格 `--style`，以及对数坐标 `--xlog/--ylog`。
+
+示例：
+```bash
+python MiniAFL/mini_afl_py/utils/csv_to_xy_plot.py data.csv --x time --y value -o out.png --kind line \
+  --title "Time vs Value" --xlabel Time --ylabel Value
+```
+
 # 项目工作说明
 
 ## 项目成员

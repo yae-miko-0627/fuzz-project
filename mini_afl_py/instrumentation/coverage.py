@@ -14,39 +14,81 @@ BITMAP_SIZE = 65536
 
 
 class CoverageData:
-    """存储整数形式 edge id 的覆盖容器（AFL 风格）。
+    """高性能覆盖容器（基于位图）。
 
-    内部 `points` 为整数集合，每个整数表示一个被命中的 edge id。
+    为了在长时间运行中保持合并性能，内部使用固定大小位图（bytearray）
+    存储覆盖位点（与 AFL 的位图大小一致）。也提供向后兼容的
+    `points` 视图（延迟计算），但主要操作使用位图进行快速 OR/计数。
     """
 
-    def __init__(self) -> None:
-        self.points: Set[int] = set()
+    def __init__(self, size: int = BITMAP_SIZE) -> None:
+        self.size = int(size)
+        self.bitmap = bytearray(self.size)
+        # 延迟构建的 points 视图（仅在显式需要时填充/更新）
+        self._points_cache = None
 
     def add_edge(self, edge_id: int) -> None:
         try:
-            self.points.add(int(edge_id))
+            idx = int(edge_id) % self.size
+            self.bitmap[idx] = 1
+            self._points_cache = None
         except Exception:
             pass
 
     def merge(self, other: "CoverageData") -> None:
-        self.points.update(other.points)
+        """把另一个 CoverageData 的位图合并进来（按位 OR）。"""
+        try:
+            if not isinstance(other, CoverageData):
+                return
+            # 位图按位合并
+            for i in range(min(self.size, other.size)):
+                if other.bitmap[i]:
+                    self.bitmap[i] = 1
+            self._points_cache = None
+        except Exception:
+            pass
+
+    def merge_and_count_new(self, other: "CoverageData") -> int:
+        """合并并返回新增命中数（新位为 1 的数量）。"""
+        new = 0
+        try:
+            if not isinstance(other, CoverageData):
+                return 0
+            msize = min(self.size, other.size)
+            for i in range(msize):
+                if other.bitmap[i] and not self.bitmap[i]:
+                    self.bitmap[i] = 1
+                    new += 1
+            self._points_cache = None
+        except Exception:
+            return 0
+        return new
 
     def __len__(self) -> int:
-        return len(self.points)
+        # 统计位图中为 1 的字节数量（视作覆盖点数）
+        return sum(1 for b in self.bitmap if b)
 
     def to_bitmap(self, size: int = BITMAP_SIZE) -> bytearray:
-        """从整数 edge id 生成简易位图（更快的本地变量/无异常路径）。"""
-        bitmap = bytearray(size)
-        if not self.points:
-            return bitmap
-        b = bitmap  # local ref
-        for e in self.points:
-            try:
-                idx = int(e) % size
-            except Exception:
-                continue
-            b[idx] = 1
-        return bitmap
+        """返回位图副本（长度为 size）。"""
+        if size == self.size:
+            return bytearray(self.bitmap)
+        # 若需要不同大小，则按索引映射
+        out = bytearray(size)
+        for i, b in enumerate(self.bitmap):
+            if b:
+                out[i % size] = 1
+        return out
+
+    @property
+    def points(self) -> Set[int]:
+        """按需构建并返回整数点集合（仅在显式访问时计算）。"""
+        if self._points_cache is None:
+            s = set()
+            for i, b in enumerate(self.bitmap):
+                if b:
+                    s.add(i)
+            self._points_cache = s
+        return self._points_cache
 
 
 def parse_afl_map(path: str) -> CoverageData:
