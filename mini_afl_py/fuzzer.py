@@ -25,6 +25,7 @@ if __name__ == "__main__" and __package__ is None:
 
 from .core.scheduler import Scheduler
 from .core.monitor import Monitor
+from .core.aggression import AggressionManager
 from .targets.command_target import CommandTarget
 from .mutators.havoc_mutator import HavocMutator
 from .mutators.bitflip_mutator import BitflipMutator
@@ -101,17 +102,46 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 	if basic_mutators is None:
 		basic_mutators = [BitflipMutator(), ArithMutator(), InterestMutator(), HavocMutator(), SpliceMutator()]
 
+	# 复合变异器：对候选执行若干次随机变异，每次从 pool 随机挑选变异器并消费其部分输出
+	class CompositeMutator:
+		def __init__(self, pool, calls=3, per_call_limit=8, rnd=None):
+			self.pool = pool
+			self.calls = calls
+			self.per_call_limit = per_call_limit
+			self._rnd = rnd or _rnd
+
+		def mutate(self, data):
+			# 对每次调用，随机选取一个变异器并从其生成器中取若干变体
+			for _ in range(self.calls):
+				m = self._rnd.choice(self.pool)
+				try:
+					gen = m.mutate(data)
+				except Exception:
+					continue
+				count = 0
+				for v in gen:
+					if v is None:
+						continue
+					yield v
+					count += 1
+					if count >= self.per_call_limit:
+						break
+
 	# 覆盖增长检测（用于决定是否优先使用基础变异器以探索新种）
 	cov_last = 0
 	cov_check_interval = 10.0  # seconds
 	last_cov_check = start_ts
 	prefer_basic = False
 
+	# Aggression manager: 在增长缓慢时触发更激进的变异参数
+	agg_manager = AggressionManager()
+	_prev_aggressive = False
+
 	# 内置激进默认（基于测试脚本的观察）
 	# - 每次 mutate() 处理更多变体以提高触发率
 	# - 对单个候选应用更多 attempts 以做局部深入搜索
-	max_variants = 50
-	max_attempts = 8
+	max_variants = 100
+	max_attempts = 16
 	
 	try:
 		# 主循环：选择候选 -> 生成变体 -> 执行 -> 记录
@@ -128,18 +158,41 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 			# 周期性评估覆盖增长，若增长缓慢则提高基础变异器优先级
 			now = time.time()
 			if (now - last_cov_check) >= cov_check_interval:
+				# 使用 Monitor 的窗口速率判断替代原先的简易判断
 				try:
 					cov_now = len(getattr(monitor, 'cumulative_cov', []))
 				except Exception:
 					cov_now = 0
-				delta = cov_now - cov_last
-				elapsed = now - last_cov_check if (now - last_cov_check) > 0 else 1.0
-				growth_rate = float(delta) / elapsed
-				# 阈值：当每秒新增 edge 低于 0.02 且窗口内新增少于 2 条时，认为增长缓慢
-				if growth_rate < 0.02 and delta < 2:
-					prefer_basic = True
-				else:
-					prefer_basic = False
+				# 更新 cov history via record_run has already occurred; 使用 Monitor.is_growth_slow
+				slow = False
+				try:
+					slow = monitor.is_growth_slow(window_seconds=int(cov_check_interval * 3), min_rate=0.02, min_delta=2)
+				except Exception:
+					slow = False
+
+				prefer_basic = bool(slow)
+				# 更新 aggression manager
+				agg_manager.update(slow)
+				# 若激进模式发生变更，则对基础变异器应用/恢复缩放
+				if agg_manager.is_aggressive != _prev_aggressive:
+					_prev_aggressive = agg_manager.is_aggressive
+					if agg_manager.is_aggressive:
+						# 启用激进模式
+						for m in basic_mutators:
+							try:
+								if hasattr(m, 'apply_aggression'):
+									m.apply_aggression(agg_manager.scale)
+							except Exception:
+								pass
+					else:
+						# 恢复为常规模式
+						for m in basic_mutators:
+							try:
+								if hasattr(m, 'clear_aggression'):
+									m.clear_aggression()
+							except Exception:
+								pass
+
 				cov_last = cov_now
 				last_cov_check = now
 
@@ -168,22 +221,38 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 
 			for _attempt in range(attempts):
 				try:
-					# 选择变异器策略：若存在专用变异器，则把基础变异器也纳入候选
+					# 选择变异器策略：若存在专用变异器，则有三种使用模式：
+					#  - 普通：优先使用专用变异器（保持高命中率）
+					#  - 瓶颈/增长慢：较高概率使用复合策略或基础变异器以探索新种
+					#  - 复合策略：在一次候选上执行若干次随机变异，每次随机挑选变异器并采样若干变体
 					if spec_mutator is not None:
-						# 当覆盖增长缓慢时优先基础变异器以探索新种；否则优先专用变异器
-						if prefer_basic:
-							# 80% 概率使用基础变异器，20% 使用专用变异器（保持多样性）
-							if _rnd.random() < 0.8:
-								chosen = _rnd.choice(basic_mutators)
-							else:
-								chosen = spec_mutator
+						# respect user override to disable auto prefer-basic switching
+						_effective_prefer_basic = False if getattr(args, 'no_auto_prefer_basic', False) else bool(prefer_basic)
+						# composite probability configurable via env; higher when in slow-growth
+						if _effective_prefer_basic:
+							comp_p = float(os.getenv('MINIAFL_COMPOSITE_PROB_SLOW', '0.6'))
 						else:
-							# 70% 概率使用专用变异器，30% 使用基础变异器（保持多样性）
-							if _rnd.random() < 0.7:
-								chosen = spec_mutator
+							comp_p = float(os.getenv('MINIAFL_COMPOSITE_PROB_NORMAL', '0.1'))
+						# decide to use composite strategy
+						if _rnd.random() < comp_p:
+							pool = [spec_mutator] + list(basic_mutators)
+							calls = _rnd.randint(1, int(os.getenv('MINIAFL_COMPOSITE_MAX_CALLS', '4')))
+							per_call = int(os.getenv('MINIAFL_COMPOSITE_PER_CALL', '8'))
+							chosen = CompositeMutator(pool, calls=calls, per_call_limit=per_call, rnd=_rnd)
+							gen = chosen.mutate(cand.data)
+						else:
+							# fallback to legacy weighting: 若处于瓶颈，倾向基础变异器；否则偏好专用变异器
+							if _effective_prefer_basic:
+								if _rnd.random() < 0.9:
+									chosen = _rnd.choice(basic_mutators)
+								else:
+									chosen = spec_mutator
 							else:
-								chosen = _rnd.choice(basic_mutators)
-						gen = chosen.mutate(cand.data)
+								if _rnd.random() < 0.7:
+									chosen = spec_mutator
+								else:
+									chosen = _rnd.choice(basic_mutators)
+							gen = chosen.mutate(cand.data)
 					else:
 						# 仅基础变异器可用时随机选择一个
 						chosen = _rnd.choice(basic_mutators)

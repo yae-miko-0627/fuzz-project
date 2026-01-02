@@ -41,6 +41,9 @@ class Monitor:
         # 缓存累计覆盖大小，避免每次访问遍历位图（昂贵）
         self._cum_cov_size = 0
         self.novelty_threshold = novelty_threshold
+        # 保留覆盖量随时间的采样，用于计算增长速率
+        # 存储为 (timestamp, cum_cov_size)
+        self._cov_history: List[tuple[float, int]] = []
 
     def record_run(self, sample_id: Optional[int], sample: bytes, status: str,
                    wall_time: float, cov: Optional[CoverageData] = None,
@@ -68,6 +71,15 @@ class Monitor:
 
         cum_cov_size = self._cum_cov_size
 
+        # 记录覆盖历史采样点（采样粒度由调用端控制，但这里保证每次 record_run 都有采样）
+        try:
+            self._cov_history.append((ts, cum_cov_size))
+            # 为避免无限增长，保留最近 1024 个点
+            if len(self._cov_history) > 1024:
+                self._cov_history.pop(0)
+        except Exception:
+            pass
+
         rec = RunRecord(timestamp=ts, sample_id=sample_id, status=status,
                         wall_time=wall_time, novelty=novelty,
                         cum_coverage=cum_cov_size,
@@ -88,6 +100,58 @@ class Monitor:
                 pass
 
         return rec
+
+    def growth_rate(self, window_seconds: int = 60) -> float:
+        """计算过去 window_seconds 窗口内的平均新增覆盖速率（edges/sec）。
+
+        若历史数据不足，返回 0.0。
+        """
+        now = time.time()
+        cutoff = now - float(window_seconds)
+        # 找到最近窗口的第一个样本
+        prev = None
+        for ts, cov in reversed(self._cov_history):
+            if ts <= cutoff:
+                prev = (ts, cov)
+                break
+        if prev is None:
+            # 若没有早期样本，则尝试使用最早的可用样本
+            if not self._cov_history:
+                return 0.0
+            prev = self._cov_history[0]
+
+        # 以最新样本为终点
+        last_ts, last_cov = self._cov_history[-1]
+        delta_cov = last_cov - prev[1]
+        delta_t = max(1e-6, last_ts - prev[0])
+        return float(delta_cov) / float(delta_t)
+
+    def is_growth_slow(self, window_seconds: int = 60, min_rate: float = 0.02, min_delta: int = 2) -> bool:
+        """判断在过去 window_seconds 内覆盖增长是否低于阈值。
+
+        - `min_rate`：每秒新增 edge 的阈值。
+        - `min_delta`：窗口总新增 edge 的最小阈值。
+        """
+        if not self._cov_history:
+            return False
+        now = time.time()
+        cutoff = now - float(window_seconds)
+        # 计算窗口内最早与最新的覆盖值
+        first = None
+        for ts, cov in self._cov_history:
+            if ts >= cutoff:
+                first = (ts, cov)
+                break
+        if first is None:
+            # 窗口内没有采样，使用最早可用
+            first = self._cov_history[0]
+        last_ts, last_cov = self._cov_history[-1]
+        delta_cov = last_cov - first[1]
+        delta_t = max(1e-6, last_ts - first[0])
+        rate = float(delta_cov) / float(delta_t)
+        if rate < float(min_rate) and delta_cov < int(min_delta):
+            return True
+        return False
 
     def export_records(self, path: Optional[str] = None) -> str:
         """把记录导出为 JSON 文件，返回文件路径。"""

@@ -28,6 +28,31 @@ class ArithMutator:
         self.wrap = bool(wrap)
         # 默认增量集合（含小幅/较大/边界附近的值）
         self.default_deltas = [1, -1, 2, -2, 8, -8, 16, -16, 127, -128, 255, -255]
+        # 保存原始参数以便激进模式放大/恢复
+        self._orig = {
+            'max_positions': int(self.max_positions),
+            'sizes': tuple(self.sizes),
+            'default_deltas': list(self.default_deltas)
+        }
+
+    def apply_aggression(self, scale: float) -> None:
+        """按比例放大尝试位置数量与增量集合宽度以更激进地搜索。"""
+        try:
+            s = max(1.0, float(scale))
+            self.max_positions = max(1, int(self._orig['max_positions'] * s))
+            # 扩展 default_deltas：添加更大幅度的随机 delta
+            extra = [random.randint(-2000, 2000) for _ in range(max(4, int(4 * (s - 1.0) + 1)))]
+            self.default_deltas = list(self._orig['default_deltas']) + extra
+        except Exception:
+            pass
+
+    def clear_aggression(self) -> None:
+        """恢复为原始参数。"""
+        try:
+            self.max_positions = int(self._orig['max_positions'])
+            self.default_deltas = list(self._orig['default_deltas'])
+        except Exception:
+            pass
 
     def _apply_word(self, data: bytearray, off: int, size: int, delta: int):
         """在偏移 off 处按字节宽度 size 应用增量 delta，返回新的 bytes 或 None。

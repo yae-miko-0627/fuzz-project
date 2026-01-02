@@ -30,6 +30,38 @@ class SpliceMutator:
         self.align = max(1, int(align))
         # 期望拼接对象与当前样本的最小差异比例（0..1）
         self.similarity_threshold = float(similarity_threshold)
+        # 保存原始参数以便激进模式下放大/恢复
+        self._orig = {
+            'attempts': int(self.attempts),
+            'min_out': int(self.min_out),
+            'max_out': int(self.max_out),
+            'align': int(self.align),
+            'similarity_threshold': float(self.similarity_threshold)
+        }
+
+    def apply_aggression(self, scale: float) -> None:
+        """在激进模式下增加拼接尝试次数并放宽相似度约束以鼓励更多拼接。"""
+        try:
+            s = max(1.0, float(scale))
+            self.attempts = max(1, int(self._orig['attempts'] * s))
+            # 放宽相似度阈值（更容易选择差异较小的样本以提高拼接机会）
+            self.similarity_threshold = max(0.0, float(self._orig['similarity_threshold'] * (1.0 - 0.25 * (s - 1.0))))
+            # 允许更大的输出长度
+            self.max_out = max(self._orig['max_out'], int(self._orig['max_out'] * s))
+            # 在激进模式下可能增加对齐宽度以尝试跨边界拼接
+            self.align = max(1, int(self._orig['align']))
+        except Exception:
+            pass
+
+    def clear_aggression(self) -> None:
+        try:
+            self.attempts = int(self._orig['attempts'])
+            self.min_out = int(self._orig['min_out'])
+            self.max_out = int(self._orig['max_out'])
+            self.align = int(self._orig['align'])
+            self.similarity_threshold = float(self._orig['similarity_threshold'])
+        except Exception:
+            pass
 
     def set_corpus(self, corpus: Sequence[bytes]):
         """更新语料池（可在运行时注入外部 corpus）。"""

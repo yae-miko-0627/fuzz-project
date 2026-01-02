@@ -29,6 +29,33 @@ class BitflipMutator:
         # 支持多种变异模式
         self.modes = ['single_bit', 'multi_bit', 'byte', 'burst', 'window']
         self.window_sizes = [2, 4, 8]
+        # 保存原始参数以便激进模式下放大/恢复
+        self._orig = {
+            'max_bits': int(self.max_bits),
+            'sample_limit': int(self.sample_limit),
+            'window_sizes': list(self.window_sizes)
+        }
+
+    def apply_aggression(self, scale: float) -> None:
+        """按比例放大采样参数以提高变异激进度。"""
+        try:
+            s = max(1.0, float(scale))
+            self.max_bits = max(8, int(self._orig['max_bits'] * s))
+            self.sample_limit = max(8, int(self._orig['sample_limit'] * s))
+            # 扩展 window sizes，增加更大块的 burst 候选
+            base = sorted(set(self._orig['window_sizes']))
+            extra = [max(base[-1] + 2, int(x * s)) for x in base]
+            self.window_sizes = sorted(list(set(base + extra)))
+        except Exception:
+            pass
+
+    def clear_aggression(self) -> None:
+        try:
+            self.max_bits = int(self._orig['max_bits'])
+            self.sample_limit = int(self._orig['sample_limit'])
+            self.window_sizes = list(self._orig['window_sizes'])
+        except Exception:
+            pass
 
     def mutate(self, data: bytes) -> Iterable[bytes]:
         """对输入数据逐位翻转并 yield 每个翻转后的变体。

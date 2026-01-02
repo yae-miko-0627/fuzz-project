@@ -42,6 +42,39 @@ class HavocMutator:
             'copy_block': 6,
             'splice': 10,
         }
+        # 用于支持激进模式，保存原始参数以便恢复
+        self._orig = {
+            'rounds': int(self.rounds),
+            'max_changes': int(self.max_changes),
+            'op_weights': dict(self.op_weights)
+        }
+
+    def apply_aggression(self, scale: float) -> None:
+        """把内部参数放大 `scale` 倍以进入更激进模式。"""
+        try:
+            s = max(1.0, float(scale))
+            self.rounds = max(1, int(self._orig['rounds'] * s))
+            self.max_changes = max(1, int(self._orig['max_changes'] * s))
+            # 对某些破坏性操作提升权重以提高扰动几率
+            new_weights = {}
+            for k, v in self._orig['op_weights'].items():
+                # 对 flip/insert/delete/splice 等操作放大
+                if k in ('flip', 'flip_nbits', 'insert', 'delete', 'splice', 'copy_block', 'block_xor'):
+                    new_weights[k] = max(1, int(v * (1.0 + (s - 1.0) * 1.2)))
+                else:
+                    new_weights[k] = max(1, int(v * (1.0 + (s - 1.0) * 0.6)))
+            self.op_weights = new_weights
+        except Exception:
+            pass
+
+    def clear_aggression(self) -> None:
+        """恢复到原始参数。"""
+        try:
+            self.rounds = int(self._orig['rounds'])
+            self.max_changes = int(self._orig['max_changes'])
+            self.op_weights = dict(self._orig['op_weights'])
+        except Exception:
+            pass
 
     def _random_edit(self, data: bytearray):
         """在字节数组上执行单次随机编辑。

@@ -56,6 +56,11 @@ class Scheduler:
     该实现为最小可用策略，便于后续替换为更复杂的基于覆盖或频率的能量调度。
     """
 
+    # 全局 crash 指纹集合（类级别），用于去重重复 crash，减少在相同崩溃上的浪费
+    _crash_fingerprints = set()
+    # 候选对应的 crash 计数（parent candidate id -> count）
+    _candidate_crash_counts = {}
+
     def __init__(self) -> None:
         self._next_id = 1
         self._corpus = {}  # type: Dict[int, Candidate]
@@ -83,7 +88,7 @@ class Scheduler:
         self._explore_default = 0.15
         self._explore_min = 0.05
         self._explore_max = 0.30
-        self._explore_stagnant = 0.30  # 覆盖停滞时提升到 30%
+        self._explore_stagnant = 0.40  # 覆盖停滞时提升到 40%
 
         # 探索池大小：默认较小，停滞时扩大
         self._explore_pool_size = 8
@@ -391,7 +396,7 @@ class Scheduler:
                 pass
         return cand
 
-    def report_result(self, sample: bytes, result: object) -> Optional[int]:
+    def report_result(self, sample: bytes, result: object, parent_id: Optional[int] = None) -> Optional[int]:
         """接收执行结果并根据简化策略更新语料池。
 
         简单策略扩展：
@@ -427,6 +432,38 @@ class Scheduler:
                         novelty = 0
             except Exception:
                 novelty = 0
+
+        # 如果是 crash/hang，先计算指纹以进行去重控制，避免重复在同一 crash 上浪费时间
+        try:
+            if status in ("crash", "hang"):
+                import hashlib as _hash
+                ecode = str(getattr(result, 'exit_code', ''))
+                err = getattr(result, 'stderr', b'') or b''
+                # 使用 stderr 前 256 字节与 exit_code 生成指纹（忽略样本差异），提高相似 crash 的去重率
+                blob = ecode.encode() + b"|" + (err[:256] if err else b'')
+                fp = _hash.sha1(blob).hexdigest()
+                if fp in self._crash_fingerprints:
+                    # 记录到 candidate crash 计数并降低 parent 的 energy，减少重复探索
+                    try:
+                        if parent_id and parent_id in self._corpus:
+                            self._candidate_crash_counts[parent_id] = self._candidate_crash_counts.get(parent_id, 0) + 1
+                            c = self._corpus[parent_id]
+                            # 大幅降低能量，避免短时间内继续从该 seed 深挖
+                            try:
+                                c.energy = max(1, int(c.energy * 0.3))
+                            except Exception:
+                                c.energy = 1
+                    except Exception:
+                        pass
+                    # 已知 crash，快速返回 None（不加入语料）
+                    return None
+                else:
+                    try:
+                        self._crash_fingerprints.add(fp)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # 使用覆盖签名判断样本是否已在语料池中（仅当两者都有覆盖签名且相同则视为重复）
         # 注意：不再使用字节级回退匹配，以避免把覆盖不同但字节相同的样本误判为重复。
@@ -651,6 +688,13 @@ class Scheduler:
         if score < 1.0:
             score = 1.0
         return score
+
+    def is_known_crash_fp(self, fp: str) -> bool:
+        """查询给定 crash 指纹是否已见过。"""
+        try:
+            return fp in getattr(self, '_crash_fingerprints', set())
+        except Exception:
+            return False
 
     @property
     def corpus(self) -> List[bytes]:
