@@ -243,7 +243,7 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 						else:
 							# fallback to legacy weighting: 若处于瓶颈，倾向基础变异器；否则偏好专用变异器
 							if _effective_prefer_basic:
-								if _rnd.random() < 0.9:
+								if _rnd.random() < 0.7:
 									chosen = _rnd.choice(basic_mutators)
 								else:
 									chosen = spec_mutator

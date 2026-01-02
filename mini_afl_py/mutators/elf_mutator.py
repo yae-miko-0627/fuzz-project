@@ -17,7 +17,6 @@ from __future__ import annotations
 import struct
 import random
 import logging
-import os
 from typing import Iterable, Optional, List, Tuple, Dict, Any
 
 
@@ -156,20 +155,9 @@ class ElfMutator:
         
         # 缓存：解析结果（避免重复解析）
         self._parse_cache: Dict[int, Tuple[Optional[dict], List[dict]]] = {}
-        # 采样与快速验证配置：限制高破坏性操作的发生频率并过滤明显损坏的变体
-        self.header_mutation_prob = 0.25  # 对 e_entry 等高破坏性 header 操作的触发概率
-        self.e_ident_mut_prob = 0.05      # 对 e_ident（class/endianness 切换）的触发概率
-        self.quick_validate = True        # 是否对每个变体做快速合法性检查，失败则丢弃
-
+        
         # 日志配置
         self._init_logger(log_level)
-        # 支持通过环境变量调整 header 变异概率，便于实验与扫描
-        try:
-            env_val = os.getenv('MINIAFL_HEADER_MUT_PROB')
-            if env_val is not None:
-                self.header_mutation_prob = float(env_val)
-        except Exception:
-            pass
 
     def _init_logger(self, log_level: int) -> None:
         """初始化日志器"""
@@ -204,15 +192,9 @@ class ElfMutator:
         # 步骤2：构建变异策略列表
         strategies = self._build_mutate_strategies(data, hdr, sections)
         
-        # 步骤3：调度策略生成变体（对每个变体做快速合法性检查以过滤明显损坏样本）
+        # 步骤3：调度策略生成变体
         variant_count = 0
         for variant in self._schedule_strategies(strategies):
-            if getattr(self, 'quick_validate', False):
-                try:
-                    if not self._quick_validate_variant(variant):
-                        continue
-                except Exception:
-                    continue
             yield variant
             variant_count += 1
         
@@ -358,9 +340,8 @@ class ElfMutator:
                     p_type = struct.unpack_from(endian + 'I', data, ph_off)[0]
                     p_flags = struct.unpack_from(endian + 'I', data, ph_off + 24)[0]
                 else:  # ELF64
-                    # ELF64 program header: p_type (4 bytes) at offset 0, p_flags (4 bytes) at offset 4
                     p_type = struct.unpack_from(endian + 'I', data, ph_off)[0]
-                    p_flags = struct.unpack_from(endian + 'I', data, ph_off + 4)[0]
+                    p_flags = struct.unpack_from(endian + 'Q', data, ph_off + 40)[0]
                 
                 phdrs.append({
                     'index': i,
@@ -373,41 +354,6 @@ class ElfMutator:
                 continue
         
         return phdrs
-
-    def _quick_validate_variant(self, data: bytes) -> bool:
-        """轻量快速验证：过滤明显损坏的 ELF 变体。
-
-        检查要点：ELF 魔数、头大小、e_phoff/e_shoff 在文件范围内、节表/程序头数量合理。
-        返回 True 表示通过，False 表示应丢弃该变体。
-        """
-        try:
-            if not _is_elf(data):
-                return False
-            # 需要至少 64 字节以解析 ELF64 header
-            if len(data) < 64:
-                return False
-            hdr = self._parse_elf_header(data)
-            if not hdr:
-                return False
-            flen = len(data)
-            # 基础字段边界检查
-            e_phoff = hdr.get('e_phoff', 0) or 0
-            e_shoff = hdr.get('e_shoff', 0) or 0
-            e_shnum = hdr.get('e_shnum', 0) or 0
-            # 偏移不能超出文件
-            if e_phoff >= flen or e_shoff >= flen:
-                return False
-            # 节数量不应过大
-            if e_shnum < 0 or e_shnum > 1000:
-                return False
-            # 检查前三个 program headers 是否越界
-            phdrs = self._parse_phdr_table(data, hdr)
-            for ph in phdrs[:3]:
-                if ph.get('offset', 0) >= flen or ph.get('offset', 0) < 0:
-                    return False
-            return True
-        except Exception:
-            return False
 
     # ----------------- 策略构建与调度 -----------------
     def _build_mutate_strategies(self, data: bytes, hdr: dict, sections: List[dict]) -> List[Tuple[str, Iterable[bytes]]]:
@@ -517,24 +463,23 @@ class ElfMutator:
         e_entry_off = ElfConst.E_ENTRY_32_OFF
         e_type_off = ElfConst.E_TYPE_OFF
         
-        # 小幅偏移 e_entry（受概率限制以降低噪声）
-        if self.rng.random() < getattr(self, 'header_mutation_prob', 0.25):
-            deltas = [1, -1, 16, -16, 256]
-            if self.strength >= 2:
-                deltas += [1024, -1024]
-
-            for d in deltas:
+        # 小幅偏移 e_entry
+        deltas = [1, -1, 16, -16, 256]
+        if self.strength >= 2:
+            deltas += [1024, -1024]
+        
+        for d in deltas:
+            nd = bytearray(data)
+            struct.pack_into(endian + 'I', nd, e_entry_off, (e_entry + d) & ElfConst.MASK_32)
+            yield bytes(nd)
+        
+        # 随机化 e_entry（高强度）
+        if self.strength >= 2:
+            for _ in range(self.strength):
                 nd = bytearray(data)
-                struct.pack_into(endian + 'I', nd, e_entry_off, (e_entry + d) & ElfConst.MASK_32)
+                randv = self.rng.randrange(0, ElfConst.MASK_32)
+                struct.pack_into(endian + 'I', nd, e_entry_off, randv)
                 yield bytes(nd)
-
-            # 随机化 e_entry（高强度，亦受概率限制）
-            if self.strength >= 2:
-                for _ in range(self.strength):
-                    nd = bytearray(data)
-                    randv = self.rng.randrange(0, ElfConst.MASK_32)
-                    struct.pack_into(endian + 'I', nd, e_entry_off, randv)
-                    yield bytes(nd)
         
         # 变异 e_type
         for t in (2, 3):
@@ -552,24 +497,23 @@ class ElfMutator:
         e_entry_off = ElfConst.E_ENTRY_64_OFF
         e_type_off = ElfConst.E_TYPE_OFF
         
-        # 小幅偏移 e_entry（受概率限制以降低噪声）
-        if self.rng.random() < getattr(self, 'header_mutation_prob', 0.25):
-            deltas = [1, -1, 16, -16, 256]
-            if self.strength >= 2:
-                deltas += [1024, -1024]
-
-            for d in deltas:
+        # 小幅偏移 e_entry
+        deltas = [1, -1, 16, -16, 256]
+        if self.strength >= 2:
+            deltas += [1024, -1024]
+        
+        for d in deltas:
+            nd = bytearray(data)
+            struct.pack_into(endian + 'Q', nd, e_entry_off, (e_entry + d) & ElfConst.MASK_64)
+            yield bytes(nd)
+        
+        # 随机化 e_entry（高强度）
+        if self.strength >= 2:
+            for _ in range(self.strength):
                 nd = bytearray(data)
-                struct.pack_into(endian + 'Q', nd, e_entry_off, (e_entry + d) & ElfConst.MASK_64)
+                randv = self.rng.randrange(0, ElfConst.MASK_64)
+                struct.pack_into(endian + 'Q', nd, e_entry_off, randv)
                 yield bytes(nd)
-
-            # 随机化 e_entry（高强度，亦受概率限制）
-            if self.strength >= 2:
-                for _ in range(self.strength):
-                    nd = bytearray(data)
-                    randv = self.rng.randrange(0, ElfConst.MASK_64)
-                    struct.pack_into(endian + 'Q', nd, e_entry_off, randv)
-                    yield bytes(nd)
         
         # 变异 e_type
         for t in (2, 3):
@@ -584,26 +528,25 @@ class ElfMutator:
         """变异 ELF 标识字段（e_ident）"""
         if len(data) < 16:
             return
-        # e_ident 切换受更低概率限制（避免语义不一致的大量变体）
-        if self.rng.random() < getattr(self, 'e_ident_mut_prob', 0.05):
-            # 切换 class 字段（offset 4）
-            nd = bytearray(data)
-            nd[4] = ElfConst.ELFCLASS64 if nd[4] == ElfConst.ELFCLASS32 else ElfConst.ELFCLASS32
-            yield bytes(nd)
-
-            # 切换字节序字段（offset 5）
-            nd2 = bytearray(data)
-            if nd2[5] in (ElfConst.ELFDATA2LSB, ElfConst.ELFDATA2MSB):
-                nd2[5] = ElfConst.ELFDATA2MSB if nd2[5] == ElfConst.ELFDATA2LSB else ElfConst.ELFDATA2LSB
-                yield bytes(nd2)
-
-            # 高强度时随机扰动 e_ident 其他字段
-            if self.strength >= 2:
-                for _ in range(self.strength):
-                    nd3 = bytearray(data)
-                    i = self.rng.randrange(1, min(15, len(nd3)-1))
-                    nd3[i] = (nd3[i] ^ self.rng.randrange(1, 256)) & 0xFF
-                    yield bytes(nd3)
+        
+        # 切换 class 字段（offset 4）
+        nd = bytearray(data)
+        nd[4] = ElfConst.ELFCLASS64 if nd[4] == ElfConst.ELFCLASS32 else ElfConst.ELFCLASS32
+        yield bytes(nd)
+        
+        # 切换字节序字段（offset 5）
+        nd2 = bytearray(data)
+        if nd2[5] in (ElfConst.ELFDATA2LSB, ElfConst.ELFDATA2MSB):
+            nd2[5] = ElfConst.ELFDATA2MSB if nd2[5] == ElfConst.ELFDATA2LSB else ElfConst.ELFDATA2LSB
+            yield bytes(nd2)
+        
+        # 高强度时随机扰动 e_ident 其他字段
+        if self.strength >= 2:
+            for _ in range(self.strength):
+                nd3 = bytearray(data)
+                i = self.rng.randrange(1, min(15, len(nd3)-1))
+                nd3[i] = (nd3[i] ^ self.rng.randrange(1, 256)) & 0xFF
+                yield bytes(nd3)
 
     def _mutate_string_table(self, data: bytes, off: int, size: int) -> Iterable[bytes]:
         """增强版字符串表变异：替换/截断/交换/插入/重复"""
@@ -911,18 +854,22 @@ class ElfMutator:
             endian = hdr['endian']
             cls = hdr['class']
             
-            # 扰动 p_type（位于 phdr 起始处）
+            # 扰动 p_type
             p_type_off = phdr['offset']
             new_type = self.rng.choice(common_pt_types)
-            struct.pack_into(endian + 'I', nd, p_type_off, new_type)
-
+            if cls == ElfConst.ELFCLASS32:
+                struct.pack_into(endian + 'I', nd, p_type_off, new_type)
+            else:
+                struct.pack_into(endian + 'I', nd, p_type_off, new_type)
+            
             # 扰动 p_flags（权限位）
-            # p_flags 在 ELF32 位于偏移 24（4 字节），在 ELF64 位于偏移 4（4 字节）
-            p_flags_off = phdr['offset'] + (24 if cls == ElfConst.ELFCLASS32 else 4)
-            old_flags = phdr.get('flags', 0) if isinstance(phdr.get('flags', 0), int) else 0
+            p_flags_off = phdr['offset'] + (24 if cls == ElfConst.ELFCLASS32 else 40)
+            old_flags = phdr['flags']
             new_flags = old_flags ^ self.rng.choice([1, 2, 4])  # 翻转 R/W/X 位
-            # 使用 32 位写入以避免覆盖其它字段（ELF64 的 p_flags 也是 32 位）
-            struct.pack_into(endian + 'I', nd, p_flags_off, new_flags)
+            if cls == ElfConst.ELFCLASS32:
+                struct.pack_into(endian + 'I', nd, p_flags_off, new_flags)
+            else:
+                struct.pack_into(endian + 'Q', nd, p_flags_off, new_flags)
             
             yield bytes(nd)
 
