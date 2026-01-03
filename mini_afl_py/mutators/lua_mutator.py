@@ -18,7 +18,7 @@ from typing import Optional
 
 
 class LuaMutator:
-    """轻量 Lua 变异器。"""
+    """ Lua 变异器。"""
 
     IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
     NUMBER_RE = re.compile(r"\b(\d+\.?\d*|\d*\.\d+)\b")

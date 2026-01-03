@@ -130,23 +130,60 @@ def run_target_with_shm(cmd: list, input_data: Optional[bytes] = None,
     timed_out = False
     # 5) 等待子进程完成，支持超时处理：先发送 terminate，再等待短暂时间，最后 kill
     try:
-        out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
         try:
-            proc.terminate()
+            out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                out, err = proc.communicate(timeout=0.5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                out, err = proc.communicate()
+        exit_code = proc.returncode
+    finally:
+        # 确保管道被关闭并且子进程被回收，避免在高频调用下累积 pipe/子进程
+        try:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
-            out, err = proc.communicate(timeout=0.5)
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=0.5)
         except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
-            out, err = proc.communicate()
-
-    exit_code = proc.returncode
+            try:
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
 
     # 6) 子进程结束后，读取共享内存中的位图并写入 map_out 文件
     #    若用户未提供 map_out，则在 workdir 下创建临时文件保存位图

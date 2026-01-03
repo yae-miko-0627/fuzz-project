@@ -142,6 +142,8 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 	# - 对单个候选应用更多 attempts 以做局部深入搜索
 	max_variants = 100
 	max_attempts = 16
+
+    
 	
 	try:
 		# 主循环：选择候选 -> 生成变体 -> 执行 -> 记录
@@ -258,6 +260,11 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 						chosen = _rnd.choice(basic_mutators)
 						gen = chosen.mutate(cand.data)
 
+					# 规范化 mutator 输出：若 mutator 返回单个 bytes/bytearray，
+					# 把它包装为可迭代集合；避免把 bytes 当作可迭代字节序列导致每次
+					# 迭代产出 int（单字节），从而错误传入 target.run。
+					if isinstance(gen, (bytes, bytearray)):
+						gen = (gen,)
 					count_v = 0
 					# 使用内置的 max_variants（激进值）
 					# max_variants 已在外部定义
@@ -271,13 +278,16 @@ def fuzz_loop(scheduler: Scheduler, target: CommandTarget, monitor: Monitor,
 						except Exception:
 							res = type('R', (), {'status': 'error', 'wall_time': 0.0, 'coverage': None, 'artifact_path': None})()
 
+                        
+
 						try:
 							monitor.record_run(sample_id=cand.id if hasattr(cand, 'id') else None,
 									 sample=variant,
 									 status=res.status,
 									 wall_time=getattr(res, 'wall_time', 0.0),
 									 cov=getattr(res, 'coverage', None),
-									 artifact_path=getattr(res, 'artifact_path', None))
+									 artifact_path=getattr(res, 'artifact_path', None),
+									 stderr=getattr(res, 'stderr', None))
 						except Exception:
 							pass
 

@@ -1,5 +1,5 @@
 """
-最小化的 CommandTarget 实现（针对 Ubuntu Docker 环境）。
+ CommandTarget 实现（针对 Ubuntu Docker 环境）。
 
 职责：
 - 启动子进程运行被测程序（每次单独新进程），
@@ -102,14 +102,20 @@ class CommandTarget:
         # 构造命令行；支持 AFL 的 "@@" 占位符：当命令中包含 "@@" 时，
         # 用输入文件路径替换该占位符；否则行为与之前一致（把路径附加为最后一参）。
         cmd = list(self.cmd) + extra_args
+        replaced = False
         if mode == "file" and input_path is not None:
-            replaced = False
             for i, part in enumerate(cmd):
                 if isinstance(part, str) and "@@" in part:
                     cmd[i] = part.replace("@@", input_path)
                     replaced = True
             if not replaced:
                 cmd = cmd + [input_path]
+
+        # If we already replaced '@@' with the input path, avoid passing 'file' mode
+        # into the SHM runner because it would append the input path again.
+        shm_mode = mode
+        if replaced and mode == "file":
+            shm_mode = "stdin"
 
         # 2) 启动子进程（在 Unix 上使用 setsid 创建新进程组）
         use_preexec = hasattr(os, "setsid")
@@ -126,7 +132,7 @@ class CommandTarget:
             if instr_mode == "shm_py":
                 exit_code, timed_out, out, err, map_out_path = run_target_with_shm(cmd,
                                                                                    input_data=input_data,
-                                                                                   mode=mode,
+                                                                                   mode=shm_mode,
                                                                                    timeout=timeout,
                                                                                    workdir=run_workdir,
                                                                                    map_out=map_out)
@@ -139,60 +145,125 @@ class CommandTarget:
                                         cwd=run_workdir,
                                         preexec_fn=preexec_fn)
 
-                # 发送输入（stdin 模式）并等待结果，处理超时
+                # 确保在任何路径下都能清理子进程与相关文件描述符，避免累积 pipe 导致内存/FD 泄露
                 try:
-                    out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
-                    timed_out = False
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    # 超时：先尝试终止，再强杀整个进程组
+                    # 发送输入（stdin 模式）并等待结果，处理超时
                     try:
-                        if use_preexec:
-                            os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
-                        else:
-                            proc.terminate()
+                        out, err = proc.communicate(input=input_data if mode == "stdin" else None, timeout=timeout)
+                        timed_out = False
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        # 超时：先尝试终止，再强杀整个进程组
+                        try:
+                            if use_preexec:
+                                os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
+                            else:
+                                proc.terminate()
+                        except Exception:
+                            pass
+                        try:
+                            out, err = proc.communicate(timeout=0.5)
+                        except Exception:
+                            try:
+                                if use_preexec:
+                                    os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+                                else:
+                                    proc.kill()
+                            except Exception:
+                                pass
+                            # 最后一次读取以确保管道被消费，避免 fd 泄露
+                            out, err = proc.communicate()
+
+                    exit_code = proc.returncode
+                finally:
+                    # 关闭可能留下的文件描述符并等待子进程结束以回收资源
+                    try:
+                        if proc.stdin:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     try:
-                        out, err = proc.communicate(timeout=0.5)
+                        if proc.stdout:
+                            try:
+                                proc.stdout.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        if proc.stderr:
+                            try:
+                                proc.stderr.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        # 等待子进程回收（非阻塞地等待短时间）
+                        proc.wait(timeout=0.5)
                     except Exception:
                         try:
-                            if use_preexec:
-                                os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
-                            else:
-                                proc.kill()
+                            proc.kill()
                         except Exception:
                             pass
-                        out, err = proc.communicate()
-
-                exit_code = proc.returncode
+                        try:
+                            proc.wait(timeout=0.5)
+                        except Exception:
+                            pass
         except Exception as e:
-            # 启动失败视为 error
+            # 启动失败视为 error，返回完整 traceback 以便诊断
+            import traceback
+            tb = traceback.format_exc()
             end = time.time()
             if tmpdir:
                 tmpdir.cleanup()
             return CommandTargetResult(status="error", exit_code=None, timed_out=False,
-                                       stdout=None, stderr=str(e).encode(), wall_time=end - start,
+                                       stdout=None, stderr=tb.encode(errors='replace'), wall_time=end - start,
                                        artifact_path=None)
 
         end = time.time()
         wall_time = end - start
 
-        # 4) 决定状态并在崩溃时保存触发输入
+        # 4) 决定状态并在崩溃或解析错误时保存触发输入
         status = "ok"
         artifact_path = None
         if timed_out:
             status = "hang"
         else:
-            # 若进程由信号结束（returncode < 0）或非零退出码，可视为 crash（简化策略）
             if exit_code is None:
                 status = "error"
             elif exit_code != 0:
-                status = "crash"
+                # 检测常见解析器（例如 libpng）的 stderr 信息，将其分类为
+                # `parse_error`（保留 artifact 以便人工复现），而不是把所有非零退出视为 crash。
+                is_parse_error = False
+                try:
+                    err_str = (err or b"").decode('utf-8', errors='replace')
+                except Exception:
+                    try:
+                        err_str = str(err)
+                    except Exception:
+                        err_str = ""
+                try:
+                    import re
+                    # 匹配 libpng 常见错误关键词（不穷尽，但覆盖常见场景）
+                    if re.search(r'libpng|crc error|idat:|incorrect data check|ihdr', err_str, flags=re.I):
+                        is_parse_error = True
+                except Exception:
+                    is_parse_error = False
+
+                if is_parse_error:
+                    status = 'parse_error'
+                else:
+                    status = 'crash'
+
+                # 保存触发输入以便后续分析（无论 crash 还是 parse_error 都保存）
                 try:
                     artifact_dir = os.path.join(run_workdir, "artifacts")
                     os.makedirs(artifact_dir, exist_ok=True)
-                    artifact_path = os.path.join(artifact_dir, f"crash_input_{int(time.time()*1000)}.bin")
+                    artifact_path = os.path.join(artifact_dir, f"{status}_input_{int(time.time()*1000)}.bin")
                     with open(artifact_path, "wb") as f:
                         f.write(input_data)
                 except Exception:

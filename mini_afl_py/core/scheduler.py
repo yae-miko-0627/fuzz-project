@@ -39,6 +39,8 @@ class Candidate:
     last_novelty: int = 0
     # 覆盖特征签名（字符串），用于基于覆盖的唯一性判定
     cov_sig: Optional[str] = None
+    # AFL++ 风格的种子状态：'new'|'interesting'|'favored'|'stable'|'crash'
+    state: str = 'new'
     # score 缓存：减少重复计算（用于周期性 prune）
     _cached_score: float = 0.0
     _cached_score_ts: float = 0.0
@@ -80,6 +82,9 @@ class Scheduler:
         self._decay_no_novelty = 0.8
         self._decay_with_novelty = 0.95
         self._max_energy_cap = 20     # 能量上限，避免单个样本长期垄断
+        # AFL++ 风格阈值适配
+        self._novelty_favored_threshold = 4  # 新增 coverage >= 4 则可被视为 favored 候选
+        self._interesting_size = 64  # 小于此大小的样本更可能被标为 interesting
 
         # 强制探索比例：以一定概率优先抽取低 cycles（新的）种子
         self._explore_fraction = 0.15
@@ -88,7 +93,8 @@ class Scheduler:
         self._explore_default = 0.15
         self._explore_min = 0.05
         self._explore_max = 0.30
-        self._explore_stagnant = 0.40  # 覆盖停滞时提升到 40%
+        # 缩减停滞时的激进探索强度（短期修复）
+        self._explore_stagnant = 0.25  # 覆盖停滞时提升到 25%
 
         # 探索池大小：默认较小，停滞时扩大
         self._explore_pool_size = 8
@@ -107,7 +113,8 @@ class Scheduler:
         self._favored_ttl = 30.0   # seconds: 若 30s 未被选中则移除
         self._favored_capacity = 20  # 最多保留多少 favored 条目
         # corpus 裁剪配置：当 corpus 超过此大小时触发 prune
-        self._max_corpus_size = 2000
+        # 缩减上限以防止语料池爆炸（短期修复）
+        self._max_corpus_size = 1200
         # 裁剪保留数量比例（保留 top_k 和 favored）
         self._prune_reserve = 0.05  # 保留 5% 作为随机/探索缓冲
 
@@ -433,6 +440,11 @@ class Scheduler:
             except Exception:
                 novelty = 0
 
+        # 如果是 parser 级别的解析错误（例如 libpng），单独处理：
+        # 不把 parse_error 视为 crash，也不把其加入语料池
+        if status == 'parse_error':
+            return None
+
         # 如果是 crash/hang，先计算指纹以进行去重控制，避免重复在同一 crash 上浪费时间
         try:
             if status in ("crash", "hang"):
@@ -484,8 +496,8 @@ class Scheduler:
                     alpha = 0.3
                     cand.avg_exec_time = alpha * t + (1 - alpha) * cand.avg_exec_time
                 cand.hits += 1
-                # 若观察到新覆盖位点（novelty），适度提升能量（有上限）
-                if novelty and novelty > 0:
+                # 若观察到新覆盖位点（novelty），仅在显著新颖时提升能量
+                if novelty and novelty >= 2:
                     boost = int(2 + novelty)
                     # 以线性增加能量，但不超过全局上限
                     try:
@@ -496,9 +508,14 @@ class Scheduler:
                         cand.last_novelty = int(novelty)
                     except Exception:
                         cand.last_novelty = 0
-                    # 标记为 favored（记录时间戳），便于后续优先探索（短期）
+                    # 标记为 favored/interesting（依据 AFL++ 风格阈值），便于后续优先探索（短期）
                     try:
-                        self._favored[cid] = time.time()
+                        if int(novelty) >= getattr(self, '_novelty_favored_threshold', 4):
+                            cand.state = 'favored'
+                            self._favored[cid] = time.time()
+                        else:
+                            # 小幅新颖度视作 interesting，仍保留在 corpus
+                            cand.state = 'interesting'
                     except Exception:
                         pass
                 # 对于 crash/hang，不给予过高能量奖励以避免资源倾斜
@@ -540,8 +557,8 @@ class Scheduler:
                     alpha = 0.3
                     cand.avg_exec_time = alpha * t + (1 - alpha) * cand.avg_exec_time
                 cand.hits += 1
-                # 若观察到新覆盖位点（novelty），适度提升能量（有上限）
-                if novelty and novelty > 0:
+                # 若观察到新覆盖位点（novelty），仅在显著新颖时提升能量（短期修复）
+                if novelty and novelty >= 2:
                     boost = int(2 + novelty)
                     # 以线性增加能量，但不超过全局上限
                     try:
@@ -552,9 +569,13 @@ class Scheduler:
                         cand.last_novelty = int(novelty)
                     except Exception:
                         cand.last_novelty = 0
-                    # 标记为 favored（记录时间戳），便于后续优先探索（短期）
+                    # 标记为 favored/interesting（依据 AFL++ 风格阈值），便于后续优先探索（短期）
                     try:
-                        self._favored[cid] = time.time()
+                        if int(novelty) >= getattr(self, '_novelty_favored_threshold', 4):
+                            cand.state = 'favored'
+                            self._favored[cid] = time.time()
+                        else:
+                            cand.state = 'interesting'
                     except Exception:
                         pass
                 # 对于 crash/hang，不给予过高能量奖励以避免资源倾斜
@@ -578,7 +599,8 @@ class Scheduler:
         # 不把 crash/hang 新样本直接加入语料池，以免语料被低质量/不稳定样本占满
         if status in ("crash", "hang"):
             return None
-        if novelty and novelty > 0:
+        # 仅在显著新颖（>=2 新点）时把样本加入语料（短期修复）
+        if novelty and novelty >= 2:
             # 新颖样本加入语料并分配基于 novelty 的能量，使用全局上限
             energy = min(self._max_energy_cap, max(6, int(1 + novelty * 3)))
             cid = self.add_seed(sample, energy=energy)
@@ -597,9 +619,20 @@ class Scheduler:
                 self._corpus[cid].last_novelty = int(novelty)
             except Exception:
                 pass
-            # 新加入的高新颖样本也应被短期优先探索（记录时间戳）
+            # 根据 AFL++ 风格设定初始 state，并短期优先探索（favored）
             try:
-                self._favored[cid] = time.time()
+                if int(novelty) >= getattr(self, '_novelty_favored_threshold', 4):
+                    self._corpus[cid].state = 'favored'
+                    self._favored[cid] = time.time()
+                else:
+                    # 若样本尺寸较小或轻度新颖则标记为 interesting
+                    try:
+                        if len(self._corpus[cid].data) <= getattr(self, '_interesting_size', 64):
+                            self._corpus[cid].state = 'interesting'
+                        else:
+                            self._corpus[cid].state = 'stable'
+                    except Exception:
+                        self._corpus[cid].state = 'interesting'
             except Exception:
                 pass
             return cid
@@ -663,6 +696,19 @@ class Scheduler:
         except Exception:
             novelty_boost = 0.0
         score += novelty_boost
+
+        # AFL++ 风格：根据候选 state 提供额外加权
+        try:
+            st = getattr(cand, 'state', None)
+            if st == 'favored':
+                # favored 候选短期应有明显优先级
+                score *= 1.5
+            elif st == 'interesting':
+                score *= 1.2
+            elif st == 'stable':
+                score *= 1.0
+        except Exception:
+            pass
 
         # 将 energy 作为乘数因子引入评分（采用对数缩放以获得更平滑的收益，减少能量垄断）
         try:

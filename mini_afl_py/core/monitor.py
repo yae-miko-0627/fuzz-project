@@ -33,7 +33,7 @@ class RunRecord:
 class Monitor:
     """监控器：维护运行历史、累计覆盖，并保存特殊样本。"""
 
-    def __init__(self, out_dir: str = "monitor_artifacts", novelty_threshold: int = 10):
+    def __init__(self, out_dir: str = "monitor_artifacts", novelty_threshold: int = 14):
         self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
         self.records: List[RunRecord] = []
@@ -47,7 +47,7 @@ class Monitor:
 
     def record_run(self, sample_id: Optional[int], sample: bytes, status: str,
                    wall_time: float, cov: Optional[CoverageData] = None,
-                   artifact_path: Optional[str] = None) -> RunRecord:
+                   artifact_path: Optional[str] = None, stderr: Optional[bytes] = None) -> RunRecord:
         """记录一次运行。
 
         - `cov`：可选的 CoverageData（若有，则用于计算 novelty 与更新累计覆盖）。
@@ -86,7 +86,7 @@ class Monitor:
                         artifact_path=artifact_path)
         self.records.append(rec)
 
-        # 仅保存高新颖度样本以避免输出目录被大量 crash/hang 填满
+        # 保存高新颖度样本以避免输出目录被大量 crash/hang 填满
         if novelty >= self.novelty_threshold:
             fname = f"sample_{int(ts*1000)}_novel.bin"
             p = os.path.join(self.out_dir, fname)
@@ -98,6 +98,27 @@ class Monitor:
                 rec.artifact_path = artifact_path
             except Exception:
                 pass
+
+        # 若为 error 状态且存在 stderr，则保存短摘要以便事后诊断（最大保存 8KB）
+        # 默认关闭此行为以避免产生大量小文件（可通过环境变量开启）
+        try:
+            export_errors = os.getenv('MINIAFL_EXPORT_ERROR_ARTIFACTS', '0').lower() in ('1', 'true', 'yes')
+            if status == 'error' and stderr and export_errors:
+                try:
+                    # 限制长度，避免写入过大内容
+                    max_len = 8 * 1024
+                    s = stderr if isinstance(stderr, (bytes, bytearray)) else str(stderr).encode(errors='replace')
+                    fname = f"error_stderr_{int(time.time()*1000)}.txt"
+                    p2 = os.path.join(self.out_dir, fname)
+                    with open(p2, 'wb') as f:
+                        f.write(s[:max_len])
+                    # 若 artifact_path 为空，指向该文件以便关联
+                    if rec.artifact_path is None:
+                        rec.artifact_path = p2
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         return rec
 
