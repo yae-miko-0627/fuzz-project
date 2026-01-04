@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import time
 import json
+import hashlib
 from dataclasses import dataclass, asdict
 from typing import Optional, List
 
@@ -28,6 +29,7 @@ class RunRecord:
     novelty: int
     cum_coverage: int
     artifact_path: Optional[str]
+    map_path: Optional[str] = None
 
 
 class Monitor:
@@ -44,6 +46,8 @@ class Monitor:
         # 保留覆盖量随时间的采样，用于计算增长速率
         # 存储为 (timestamp, cum_cov_size)
         self._cov_history: List[tuple[float, int]] = []
+        # 已保存的 coverage map 哈希集合，用于避免重复保存相同 coverage 快照
+        self._saved_map_hashes: set[str] = set()
 
     def record_run(self, sample_id: Optional[int], sample: bytes, status: str,
                    wall_time: float, cov: Optional[CoverageData] = None,
@@ -54,20 +58,40 @@ class Monitor:
         - `artifact_path`：若产生崩溃，该路径可指向已保存的触发输入文件。
         返回创建的 RunRecord。
         """
-        ts = time.time()
+        # 使用单调时钟以避免系统时间跳变导致的异常时间戳
+        ts = time.monotonic()
         novelty = 0
+        # map_path 用于记录保存的 coverage map 文件（若已保存）
+        map_path: Optional[str] = None
+
         if cov is not None:
-            # 使用 CoverageData.merge_and_count_new 做按位合并并直接获取新增命中数，
-            # 避免把位图转换为大集合（每次 65536 次迭代）的开销。
+            # 先计算新增命中数而不立即修改累计位图，只有在确实有新增时才合并。
             try:
-                novelty = self.cumulative_cov.merge_and_count_new(cov)
+                msize = min(self.cumulative_cov.size, cov.size)
+                new_cnt = 0
+                # 直接访问底层 bitmap 可以最快计算新增位
+                for i in range(msize):
+                    if cov.bitmap[i] and not self.cumulative_cov.bitmap[i]:
+                        new_cnt += 1
+                novelty = int(new_cnt)
             except Exception:
-                # 退回兼容实现（不应常发生）
-                new_points = set(cov.points) - set(self.cumulative_cov.points)
-                novelty = len(new_points)
-                self.cumulative_cov.merge(cov)
-            # 更新缓存的累计覆盖大小
-            self._cum_cov_size += novelty
+                try:
+                    new_points = set(cov.points) - set(self.cumulative_cov.points)
+                    novelty = len(new_points)
+                except Exception:
+                    novelty = 0
+
+            # 仅当有新增 coverage 时，真正合并到累计位图并更新缓存计数
+            if novelty > 0:
+                try:
+                    merged_new = self.cumulative_cov.merge_and_count_new(cov)
+                    self._cum_cov_size += merged_new
+                except Exception:
+                    try:
+                        self.cumulative_cov.merge(cov)
+                        self._cum_cov_size += novelty
+                    except Exception:
+                        pass
 
         cum_cov_size = self._cum_cov_size
 
@@ -83,19 +107,36 @@ class Monitor:
         rec = RunRecord(timestamp=ts, sample_id=sample_id, status=status,
                         wall_time=wall_time, novelty=novelty,
                         cum_coverage=cum_cov_size,
-                        artifact_path=artifact_path)
+                        artifact_path=artifact_path,
+                        map_path=None)
         self.records.append(rec)
 
-        # 保存高新颖度样本以避免输出目录被大量 crash/hang 填满
-        if novelty >= self.novelty_threshold:
-            fname = f"sample_{int(ts*1000)}_novel.bin"
-            p = os.path.join(self.out_dir, fname)
+        # 保存高新颖度样本：新增覆盖且通过 map 去重后再保存；同时保存 coverage map 快照
+        if cov is not None and novelty >= self.novelty_threshold:
             try:
-                with open(p, "wb") as f:
-                    f.write(sample)
-                if artifact_path is None:
-                    artifact_path = p
-                rec.artifact_path = artifact_path
+                map_bytes = cov.to_bitmap(self.cumulative_cov.size)
+                h = hashlib.sha1(bytes(map_bytes)).hexdigest()
+                if h not in self._saved_map_hashes:
+                    # 保存输入样本
+                    fname = f"sample_{int(ts*1000)}_novel.bin"
+                    p = os.path.join(self.out_dir, fname)
+                    with open(p, "wb") as f:
+                        f.write(sample)
+                    # 保存 map 快照
+                    map_fname = f"sample_{int(ts*1000)}_novel.map.bin"
+                    map_p = os.path.join(self.out_dir, map_fname)
+                    try:
+                        with open(map_p, 'wb') as mf:
+                            mf.write(bytes(map_bytes))
+                    except Exception:
+                        map_p = None
+
+                    # 标记并关联
+                    self._saved_map_hashes.add(h)
+                    if artifact_path is None:
+                        artifact_path = p
+                    rec.artifact_path = artifact_path
+                    rec.map_path = map_p
             except Exception:
                 pass
 
@@ -127,7 +168,7 @@ class Monitor:
 
         若历史数据不足，返回 0.0。
         """
-        now = time.time()
+        now = time.monotonic()
         cutoff = now - float(window_seconds)
         # 找到最近窗口的第一个样本
         prev = None
@@ -155,7 +196,7 @@ class Monitor:
         """
         if not self._cov_history:
             return False
-        now = time.time()
+        now = time.monotonic()
         cutoff = now - float(window_seconds)
         # 计算窗口内最早与最新的覆盖值
         first = None
@@ -185,4 +226,4 @@ class Monitor:
         return path
 
 
-__all__ = ["Monitor", "RunRecord"]
+    __all__ = ["Monitor", "RunRecord"]

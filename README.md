@@ -62,7 +62,7 @@ fuzzer 在结束时调用 monitor.export_records() 导出 monitor_records.json�
 挂载宿主工作区，开启 ptrace 权限。
 ```powershell
   docker run -d --name fuzz_T01 `
-  -v "C:\Users\11053\Desktop\fuzz:/fuzz" `
+  -v "C:\Users\xxxxx\Desktop\fuzz:/fuzz" `
   -w /fuzz `
   --cap-add=SYS_PTRACE --security-opt seccomp=unconfined `
   --restart unless-stopped `
@@ -170,12 +170,12 @@ cd /fuzz && python3 -u MiniAFL/mini_afl_py/fuzzer.py \
 ```
 
 ```powershell
-# PowerShell（宿主）: 前台运行 30s（file 模式），不要覆盖已有种子目录
+# PowerShell（宿主）: 前台运行 30s（file 模式）
 docker exec -i fuzz_T02 bash -lc "rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output /fuzz/T02/output/monitor_artifacts; cd /fuzz && python3 -u MiniAFL/mini_afl_py/fuzzer.py --target '/fuzz/T02/build/readelf -a @@ @@' --seeds /fuzz/T02/seeds --outdir /fuzz/T02/output --mode file --time 30 --status-interval 5"
 ```
 
 ```powershell
-# PowerShell（宿主）: 后台运行 24 小时，日志写入 output/fuzzer.log（保留现有 seeds，不要用 printf 覆盖）
+# PowerShell（宿主）: 后台运行 24 小时，日志写入 output/fuzzer.log
 docker exec -d fuzz_T02 bash -lc "rm -rf /fuzz/T02/output/*; mkdir -p /fuzz/T02/output /fuzz/T02/output/monitor_artifacts; cd /fuzz && nohup python3 -u MiniAFL/mini_afl_py/fuzzer.py --target '/fuzz/T02/build/readelf -a @@ @@' --seeds /fuzz/T02/seeds --outdir /fuzz/T02/output --mode file --time 86400 --status-interval 60 > /fuzz/T02/output/fuzzer.log 2>&1 &"
 ```
 
